@@ -222,65 +222,86 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                     if col not in df_mods.columns: df_mods[col] = ""
                 df_mods = df_mods[mod_cols]
 
-            version   = 1
-            dest_xlsx = laporan_dir / f"{safe_name}.xlsx"
-            while dest_xlsx.exists():
-                version  += 1
-                dest_xlsx = laporan_dir / f"{safe_name}-{version:02d}.xlsx"
+            # Overwrite approach for two separate files (Cookie Mode)
+            item_xlsx = laporan_dir / f"{safe_name}_menu_item.xlsx"
+            mod_xlsx  = laporan_dir / f"{safe_name}_menu_modifier.xlsx"
+            
+            # Hapus file lama jika ada
+            for f in (item_xlsx, mod_xlsx):
+                try: f.unlink()
+                except Exception: pass
 
-            with pd.ExcelWriter(dest_xlsx, engine="openpyxl") as writer:
-                df_items.to_excel(writer, sheet_name="Item",     index=False)
-                df_mods.to_excel(writer,  sheet_name="Modifier", index=False)
+            with pd.ExcelWriter(item_xlsx, engine="openpyxl") as writer:
+                df_items.to_excel(writer, sheet_name="Item", index=False)
+            with pd.ExcelWriter(mod_xlsx, engine="openpyxl") as writer:
+                df_mods.to_excel(writer, sheet_name="Modifier", index=False)
 
-            log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — {len(matched_items)} items, {len(matched_mods)} modifiers → {dest_xlsx.name}")
+            log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — {len(matched_items)} items, {len(matched_mods)} modifiers → {item_xlsx.name} & {mod_xlsx.name}")
 
         # --- Master merge (cookie mode) ---
         log.info("="*60)
         log.info("  [COOKIE MODE] SEMUA PORTAL SELESAI")
         log.info("="*60)
 
-        xlsx_files = sorted(laporan_dir.glob("*.xlsx")) if laporan_dir.exists() else []
-        xlsx_files = [f for f in xlsx_files if f.stem not in ("MASTER", "0Master") and not any(f.stem.startswith(p) for p in ("0Master-", "MASTER-", "CUSTOM_", "BASELINE_CUSTOM_"))]
+        # Merge Items
+        item_files = sorted(laporan_dir.glob("*_menu_item.xlsx")) if laporan_dir.exists() else []
+        item_files = [f for f in item_files if f.name != "0Master_menu_item.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
         if outlet_filter or branch_filter:
             valid_stems = set()
             for p_info in portals:
                 ps = (f"{p_info['outlet']}_{p_info['branch']}" if p_info['branch'] else p_info['outlet']).replace("/", "_").replace("\\", "_")
-                valid_stems.add(ps)
-            xlsx_files = [f for f in xlsx_files if f.stem in valid_stems]
+                valid_stems.add(f"{ps}_menu_item")
+            item_files = [f for f in item_files if f.stem in valid_stems]
 
-        if xlsx_files:
-            log.info(f"Merging {len(xlsx_files)} files into 0Master.xlsx...")
-            all_i, all_m = [], []
-            for xp in xlsx_files:
+        all_items = []
+        if item_files:
+            for xp in item_files:
                 try:
-                    di = pd.read_excel(xp, sheet_name="Item",     dtype=str)
-                    dm = pd.read_excel(xp, sheet_name="Modifier", dtype=str)
-                    if not di.empty: all_i.append(di)
-                    if not dm.empty: all_m.append(dm)
-                    log.info(f"  🔍 {xp.name} | Items: {len(di)} | Modifiers: {len(dm)}")
+                    df = pd.read_excel(xp, sheet_name="Item", dtype=str)
+                    if not df.empty: all_items.append(df)
+                    log.info(f"  🔍 [MERGE ITEM] Loaded '{xp.name}' | Items: {len(df)}")
                 except Exception as e:
                     log.error(f"  ❌ Gagal baca '{xp.name}': {e}")
+        
+        master_items = pd.concat(all_items, ignore_index=True) if all_items else pd.DataFrame(columns=item_cols)
+        master_item_xlsx = laporan_dir / "0Master_menu_item.xlsx"
+        try: master_item_xlsx.unlink()
+        except Exception: pass
+        with pd.ExcelWriter(master_item_xlsx, engine="openpyxl") as writer:
+            master_items.to_excel(writer, sheet_name="Item", index=False)
 
-            master_items = pd.concat(all_i, ignore_index=True) if all_i else pd.DataFrame(columns=item_cols)
-            master_mods  = pd.concat(all_m, ignore_index=True) if all_m else pd.DataFrame(columns=mod_cols)
+        # Merge Modifiers
+        mod_files = sorted(laporan_dir.glob("*_menu_modifier.xlsx")) if laporan_dir.exists() else []
+        mod_files = [f for f in mod_files if f.name != "0Master_menu_modifier.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
+        if outlet_filter or branch_filter:
+            valid_stems = set()
+            for p_info in portals:
+                ps = (f"{p_info['outlet']}_{p_info['branch']}" if p_info['branch'] else p_info['outlet']).replace("/", "_").replace("\\", "_")
+                valid_stems.add(f"{ps}_menu_modifier")
+            mod_files = [f for f in mod_files if f.stem in valid_stems]
 
-            ver = 1
-            master_xlsx = laporan_dir / "0Master.xlsx"
-            while master_xlsx.exists():
-                ver += 1
-                master_xlsx = laporan_dir / f"0Master-{ver:02d}.xlsx"
+        all_mods = []
+        if mod_files:
+            for xp in mod_files:
+                try:
+                    df = pd.read_excel(xp, sheet_name="Modifier", dtype=str)
+                    if not df.empty: all_mods.append(df)
+                    log.info(f"  🔍 [MERGE MODIFIER] Loaded '{xp.name}' | Modifiers: {len(df)}")
+                except Exception as e:
+                    log.error(f"  ❌ Gagal baca '{xp.name}': {e}")
+                    
+        master_mods = pd.concat(all_mods, ignore_index=True) if all_mods else pd.DataFrame(columns=mod_cols)
+        master_mod_xlsx = laporan_dir / "0Master_menu_modifier.xlsx"
+        try: master_mod_xlsx.unlink()
+        except Exception: pass
+        with pd.ExcelWriter(master_mod_xlsx, engine="openpyxl") as writer:
+            master_mods.to_excel(writer, sheet_name="Modifier", index=False)
 
-            with pd.ExcelWriter(master_xlsx, engine="openpyxl") as writer:
-                master_items.to_excel(writer, sheet_name="Item",     index=False)
-                master_mods.to_excel(writer,  sheet_name="Modifier", index=False)
+        log.info(f"✓ Laporan Master: {master_item_xlsx} & {master_mod_xlsx}")
+        log.info(f"  Total Baris Item     : {len(master_items):,}")
+        log.info(f"  Total Baris Modifier : {len(master_mods):,}")
 
-            log.info(f"✓ Laporan Master: {master_xlsx}")
-            log.info(f"  Total Baris Item     : {len(master_items):,}")
-            log.info(f"  Total Baris Modifier : {len(master_mods):,}")
-        else:
-            log.info("[SKIP] Tidak ada file XLSX untuk digabung.")
-
-        return  # ← selesai, skip Playwright mode
+        return  # selesai, skip Playwright mode
 
     log.info("="*60)
     log.info(f"  GRAB MULTI-PORTAL AUTOMATION ({len(portals)} portals)")
@@ -395,13 +416,13 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                                     mod_copy["Store ID"] = portal["store_id"]
                                 matched_modifiers.append(mod_copy)
 
-                        # Hapus semua versi lama file portal ini sebelum simpan baru
-                        for old_f in laporan_dir.glob(f"{portal_safe_name}*.xlsx"):
-                            try:
-                                old_f.unlink()
-                            except Exception:
-                                pass
-                        dest_xlsx = laporan_dir / f"{portal_safe_name}.xlsx"
+                        item_xlsx = laporan_dir / f"{portal_safe_name}_menu_item.xlsx"
+                        mod_xlsx  = laporan_dir / f"{portal_safe_name}_menu_modifier.xlsx"
+                        
+                        # Hapus file lama jika ada
+                        for f in (item_xlsx, mod_xlsx):
+                            try: f.unlink()
+                            except Exception: pass
 
                         df_items = pd.DataFrame(matched_items)
                         df_mods = pd.DataFrame(matched_modifiers)
@@ -435,11 +456,12 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                                     df_mods[col] = ""
                             df_mods = df_mods[mod_cols]
 
-                        with pd.ExcelWriter(dest_xlsx, engine="openpyxl") as writer:
+                        with pd.ExcelWriter(item_xlsx, engine="openpyxl") as writer:
                             df_items.to_excel(writer, sheet_name="Item", index=False)
+                        with pd.ExcelWriter(mod_xlsx, engine="openpyxl") as writer:
                             df_mods.to_excel(writer, sheet_name="Modifier", index=False)
                             
-                        log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — Saved to: {dest_xlsx.name}")
+                        log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — Saved to: {item_xlsx.name} & {mod_xlsx.name}")
 
                 except Exception as e:
                     log.error(f"  ✗ [ACCOUNT] {username} CRITICAL ERROR: {str(e)}")
@@ -475,43 +497,55 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
         log.info("  ✓ ALL ACCOUNTS PROCESSED SUCCESSFULLY")
     log.info("="*60)
 
-    # --- Gabungkan semua CSV menjadi file master ---
+    # --- Gabungkan semua XLSX menjadi file master ---
     if output_dir:
         laporan_dir = Path(output_dir)
     else:
         laporan_dir = Path("laporan") / "menu"
 
-    xlsx_files = sorted(laporan_dir.glob("*.xlsx")) if laporan_dir.exists() else []
-    xlsx_files = [f for f in xlsx_files if f.stem != "MASTER" and f.stem != "0Master" and not f.stem.startswith("0Master-") and not f.stem.startswith("MASTER-") and not f.stem.startswith("CUSTOM_") and not f.stem.startswith("BASELINE_CUSTOM_")]
+    # Merge Items
+    item_files = sorted(laporan_dir.glob("*_menu_item.xlsx")) if laporan_dir.exists() else []
+    item_files = [f for f in item_files if f.name != "0Master_menu_item.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
     if outlet_filter or branch_filter:
-        valid_stems = []
+        valid_stems = set()
         for p_info in portals:
-            portal_safe_name = f"{p_info['outlet']}_{p_info['branch']}" if p_info['branch'] else f"{p_info['outlet']}"
-            portal_safe_name = portal_safe_name.replace("/", "_").replace("\\", "_")
-            valid_stems.append(portal_safe_name)
-        xlsx_files = [f for f in xlsx_files if f.stem in valid_stems]
+            ps = (f"{p_info['outlet']}_{p_info['branch']}" if p_info['branch'] else p_info['outlet']).replace("/", "_").replace("\\", "_")
+            valid_stems.add(f"{ps}_menu_item")
+        item_files = [f for f in item_files if f.stem in valid_stems]
 
-    if not xlsx_files:
-        print("\n[SKIP] Tidak ada file XLSX untuk digabung.")
-        return
-
-    print(f"\nScanning and merging {len(xlsx_files)} raw menu Excel files...")
+    print(f"\nScanning and merging {len(item_files)} raw item menu Excel files...")
     all_items_frames = []
-    all_mods_frames = []
     
-    for xlsx_path in xlsx_files:
+    for xlsx_path in item_files:
         try:
             df_item = pd.read_excel(xlsx_path, sheet_name="Item", dtype=str)
-            df_mod = pd.read_excel(xlsx_path, sheet_name="Modifier", dtype=str)
-            
             if not df_item.empty:
                 all_items_frames.append(df_item)
+            print(f"  🔍 [MERGE ITEM] Loaded '{xlsx_path.name}' | Items: {len(df_item)}")
+        except Exception as e:
+            print(f"  ❌ [MERGE ITEM] Gagal membaca '{xlsx_path.name}': {e}")
+
+    # Merge Modifiers
+    mod_files = sorted(laporan_dir.glob("*_menu_modifier.xlsx")) if laporan_dir.exists() else []
+    mod_files = [f for f in mod_files if f.name != "0Master_menu_modifier.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
+    if outlet_filter or branch_filter:
+        valid_stems = set()
+        for p_info in portals:
+            ps = (f"{p_info['outlet']}_{p_info['branch']}" if p_info['branch'] else p_info['outlet']).replace("/", "_").replace("\\", "_")
+            valid_stems.add(f"{ps}_menu_modifier")
+        mod_files = [f for f in mod_files if f.stem in valid_stems]
+
+    print(f"\nScanning and merging {len(mod_files)} raw modifier menu Excel files...")
+    all_mods_frames = []
+    
+    for xlsx_path in mod_files:
+        try:
+            df_mod = pd.read_excel(xlsx_path, sheet_name="Modifier", dtype=str)
             if not df_mod.empty:
                 all_mods_frames.append(df_mod)
-                
-            print(f"  🔍 [MERGE] Loaded '{xlsx_path.name}' | Items: {len(df_item)} | Modifiers: {len(df_mod)}")
+            print(f"  🔍 [MERGE MODIFIER] Loaded '{xlsx_path.name}' | Modifiers: {len(df_mod)}")
         except Exception as e:
-            print(f"  ❌ [MERGE] Gagal membaca '{xlsx_path.name}': {e}")
+            print(f"  ❌ [MERGE MODIFIER] Gagal membaca '{xlsx_path.name}': {e}")
 
     # Combine
     item_cols = [
@@ -530,20 +564,19 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
     master_items = pd.concat(all_items_frames, ignore_index=True) if all_items_frames else pd.DataFrame(columns=item_cols)
     master_mods = pd.concat(all_mods_frames, ignore_index=True) if all_mods_frames else pd.DataFrame(columns=mod_cols)
 
-    filename_prefix = "0Master"
-    # Hapus file master lama agar tidak menumpuk
-    for old_f in laporan_dir.glob(f"{filename_prefix}*.xlsx"):
-        try:
-            old_f.unlink()
-        except Exception:
-            pass
-    master_xlsx = laporan_dir / f"{filename_prefix}.xlsx"
+    master_item_xlsx = laporan_dir / "0Master_menu_item.xlsx"
+    master_mod_xlsx = laporan_dir / "0Master_menu_modifier.xlsx"
+    
+    for old_f in (master_item_xlsx, master_mod_xlsx):
+        try: old_f.unlink()
+        except Exception: pass
 
-    with pd.ExcelWriter(master_xlsx, engine="openpyxl") as writer:
+    with pd.ExcelWriter(master_item_xlsx, engine="openpyxl") as writer:
         master_items.to_excel(writer, sheet_name="Item", index=False)
+    with pd.ExcelWriter(master_mod_xlsx, engine="openpyxl") as writer:
         master_mods.to_excel(writer, sheet_name="Modifier", index=False)
 
-    log.info(f"✓ Laporan Master Excel Gabungan: {master_xlsx}")
+    log.info(f"✓ Laporan Master Excel Gabungan: {master_item_xlsx} & {master_mod_xlsx}")
     log.info(f"  Total Baris Item     : {len(master_items):,}")
     log.info(f"  Total Baris Modifier : {len(master_mods):,}")
 
