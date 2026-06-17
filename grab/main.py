@@ -172,14 +172,14 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
         laporan_dir.mkdir(parents=True, exist_ok=True)
 
         item_cols = [
-            "Link outlet", "Nama panjang", "Store ID",
+            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
             "Nama kategori", "Nama item", "Jumlah terjual", "Jumlah modifier group",
             "Jumlah modifier", "Deskripsi item", "Harga item sebelum promo (harga coret)",
             "Harga item setelah promo (harga coret)", "Nominal atau persentase promo (harga coret)",
             "Ketersediaan item", "Link foto"
         ]
         mod_cols = [
-            "Link outlet", "Nama panjang", "Store ID",
+            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
             "Nama item", "Nama modifier group", "Nama modifier", "Tipe modifier",
             "Minimal", "Maksimal", "Harga modifier", "Ketersediaan modifier"
         ]
@@ -193,6 +193,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
             def _patch(row, portal=portal):
                 r = dict(row)
                 r["Nama panjang"] = portal["outlet"]
+                r["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                 if portal["store_id"]:
                     r["Store ID"] = portal["store_id"]
                 return r
@@ -389,6 +390,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                             if target_clean in item_clean or item_clean in target_clean:
                                 item_copy = dict(item)
                                 item_copy["Nama panjang"] = portal["outlet"]
+                                item_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     item_copy["Store ID"] = portal["store_id"]
                                 matched_items.append(item_copy)
@@ -398,6 +400,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                             if target_clean in mod_clean or mod_clean in target_clean:
                                 mod_copy = dict(mod)
                                 mod_copy["Nama panjang"] = portal["outlet"]
+                                mod_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     mod_copy["Store ID"] = portal["store_id"]
                                 matched_modifiers.append(mod_copy)
@@ -406,12 +409,14 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                             for item in items:
                                 item_copy = dict(item)
                                 item_copy["Nama panjang"] = portal["outlet"]
+                                item_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     item_copy["Store ID"] = portal["store_id"]
                                 matched_items.append(item_copy)
                             for mod in modifiers:
                                 mod_copy = dict(mod)
                                 mod_copy["Nama panjang"] = portal["outlet"]
+                                mod_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     mod_copy["Store ID"] = portal["store_id"]
                                 matched_modifiers.append(mod_copy)
@@ -428,14 +433,14 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                         df_mods = pd.DataFrame(matched_modifiers)
                         
                         item_cols = [
-                            "Link outlet", "Nama panjang", "Store ID",
+                            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
                             "Nama kategori", "Nama item", "Jumlah terjual", "Jumlah modifier group",
                             "Jumlah modifier", "Deskripsi item", "Harga item sebelum promo (harga coret)",
                             "Harga item setelah promo (harga coret)", "Nominal atau persentase promo (harga coret)",
                             "Ketersediaan item", "Link foto"
                         ]
                         mod_cols = [
-                            "Link outlet", "Nama panjang", "Store ID",
+                            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
                             "Nama item", "Nama modifier group", "Nama modifier", "Tipe modifier",
                             "Minimal", "Maksimal", "Harga modifier", "Ketersediaan modifier"
                         ]
@@ -549,14 +554,14 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
 
     # Combine
     item_cols = [
-        "Link outlet", "Nama panjang", "Store ID",
+        "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
         "Nama kategori", "Nama item", "Jumlah terjual", "Jumlah modifier group",
         "Jumlah modifier", "Deskripsi item", "Harga item sebelum promo (harga coret)",
         "Harga item setelah promo (harga coret)", "Nominal atau persentase promo (harga coret)",
         "Ketersediaan item", "Link foto"
     ]
     mod_cols = [
-        "Link outlet", "Nama panjang", "Store ID",
+        "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
         "Nama item", "Nama modifier group", "Nama modifier", "Tipe modifier",
         "Minimal", "Maksimal", "Harga modifier", "Ketersediaan modifier"
     ]
