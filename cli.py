@@ -57,6 +57,29 @@ def _resolve_output_dir(platform_name: str) -> str:
     os.makedirs(out, exist_ok=True)
     return out
 
+def clear_local_data():
+    output_dir = _resolve_output_dir("grab")
+    if os.path.exists(output_dir):
+        import shutil
+        print(f"\n  {YELLOW}[INFO] Menghapus data laporan lokal di: {output_dir}...{RESET}")
+        deleted_files = 0
+        deleted_dirs = 0
+        for item in os.listdir(output_dir):
+            item_path = os.path.join(output_dir, item)
+            try:
+                if os.path.isfile(item_path):
+                    os.unlink(item_path)
+                    deleted_files += 1
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                    deleted_dirs += 1
+            except Exception as e:
+                print(f"  {RED}[ERROR] Gagal menghapus {item}: {e}{RESET}")
+        print(f"  {GREEN}✓ Selesai! Berhasil menghapus {deleted_files} file dan {deleted_dirs} folder laporan lokal.{RESET}")
+    else:
+        print(f"\n  {CYAN}[INFO] Direktori laporan kosong/tidak ditemukan.{RESET}")
+    import time
+    time.sleep(2)
 
 def run_grab(user_filter: str = None, outlet_filter: str = None, branch_filter: str = None):
     grab_dir = os.path.join(os.path.dirname(__file__), "grab")
@@ -116,11 +139,12 @@ def interactive_mode():
             print(f"  {BOLD}Pilih cakupan outlet:{RESET}")
             print(f"    {GREEN}[1]{RESET} Pilih semua outlet")
             print(f"    {YELLOW}[2]{RESET} Pilih custom (Filter spesifik){RESET}")
-            print(f"    {RED}[3]{RESET} Keluar")
+            print(f"    {CYAN}[3]{RESET} Bersihkan data laporan lokal (Clear local data){RESET}")
+            print(f"    {RED}[4]{RESET} Keluar")
             print()
             
-            scope_choice = input(f"  {BOLD}Pilihan (1/2/3):{RESET} ").strip()
-            if scope_choice == "3":
+            scope_choice = input(f"  {BOLD}Pilihan (1/2/3/4):{RESET} ").strip()
+            if scope_choice == "4":
                 print("  Keluar.")
                 sys.exit(0)
             elif scope_choice == "1":
@@ -130,8 +154,10 @@ def interactive_mode():
             elif scope_choice == "2":
                 df_main = load_df()
                 state = "grab_outlet"
+            elif scope_choice == "3":
+                clear_local_data()
             else:
-                print(f"  {RED}Input tidak valid. Masukkan 1, 2, atau 3.{RESET}")
+                print(f"  {RED}Input tidak valid. Masukkan 1, 2, 3, atau 4.{RESET}")
                 import time
                 time.sleep(1)
 

@@ -68,6 +68,63 @@ log = setup_logger()
 
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ3tLKBNXDqRgBw0mNhKZFxgvKx-JoiTDzm_s5Ix1cm7O6HCv4IvExOLR2HSRVaXSsx82V348mcr9X4/pub?gid=0&single=true&output=csv"
 
+def check_and_upload_gdrive(master_item_xlsx, master_mod_xlsx, portals):
+    """
+    Fungsi penunjang untuk otomatis mengunggah file hasil laporan (.xlsx) yang relevan
+    (file master dan file per-outlet yang diproses pada sesi ini) ke Google Drive.
+    """
+    gdrive_url = os.environ.get("GDRIVE_APPSCRIPT_URL")
+    if gdrive_url:
+        log.info("\n📤 [PROGRESS] Mendeteksi konfigurasi Google Drive. Memulai proses unggah file relevan...")
+        parent_dir = Path(__file__).resolve().parent.parent
+        if str(parent_dir) not in sys.path:
+            sys.path.append(str(parent_dir))
+        try:
+            from upload_to_gdrive import upload_file_to_gdrive
+            folder_id = os.environ.get("GDRIVE_FOLDER_ID")
+            
+            laporan_dir = Path(master_item_xlsx).parent
+            
+            # Kumpulkan nama file aman (safe names) untuk outlet yang diproses di sesi ini
+            active_safe_names = set()
+            for p in portals:
+                safe_name = (f"{p['outlet']}_{p['branch']}" if p['branch'] else p['outlet']).replace("/", "_").replace("\\", "_")
+                active_safe_names.add(safe_name)
+                
+            # Filter file .xlsx yang ada di direktori laporan
+            xlsx_files = sorted(laporan_dir.glob("*.xlsx"))
+            files_to_upload = []
+            
+            for f in xlsx_files:
+                # Selalu unggah file master
+                if f.name in ("0Master_menu_item.xlsx", "0Master_menu_modifier.xlsx"):
+                    files_to_upload.append(f)
+                    continue
+                
+                # Hanya unggah file per-outlet jika safe_name-nya ada di daftar aktif sesi ini
+                stem = f.stem
+                for active_name in active_safe_names:
+                    if stem == f"{active_name}_menu_item" or stem == f"{active_name}_menu_modifier":
+                        files_to_upload.append(f)
+                        break
+            
+            if not files_to_upload:
+                log.warning("⚠️ Tidak ada file .xlsx relevan yang ditemukan di folder laporan untuk diunggah.")
+                return
+                
+            log.info(f"Ditemukan {len(files_to_upload)} file .xlsx relevan (master + outlet aktif) untuk diunggah.")
+            success_count = 0
+            for f_path in files_to_upload:
+                if upload_file_to_gdrive(str(f_path), gdrive_url, folder_id):
+                    success_count += 1
+                
+            if success_count == len(files_to_upload):
+                log.info(f"✓ Berhasil mengunggah semua ({success_count}/{len(files_to_upload)}) file laporan ke Google Drive.")
+            else:
+                log.warning(f"⚠️ Hanya berhasil mengunggah {success_count} dari {len(files_to_upload)} file laporan ke Google Drive.")
+        except Exception as e:
+            log.error(f"  ❌ Gagal mengunggah secara otomatis ke Google Drive: {e}")
+
 async def run_all(date_start: str = None, date_end: str = None, output_dir: str = None, user_filter: str = None, outlet_filter: str = None, branch_filter: str = None):
     # Reload env just in case
     load_dotenv(override=True)
@@ -172,14 +229,14 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
         laporan_dir.mkdir(parents=True, exist_ok=True)
 
         item_cols = [
-            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
+            "Link outlet", "Nama panjang", "Store ID",
             "Nama kategori", "Nama item", "Jumlah terjual", "Jumlah modifier group",
             "Jumlah modifier", "Deskripsi item", "Harga item sebelum promo (harga coret)",
             "Harga item setelah promo (harga coret)", "Nominal atau persentase promo (harga coret)",
             "Ketersediaan item", "Link foto"
         ]
         mod_cols = [
-            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
+            "Link outlet", "Nama panjang", "Store ID",
             "Nama item", "Nama modifier group", "Nama modifier", "Tipe modifier",
             "Minimal", "Maksimal", "Harga modifier", "Ketersediaan modifier"
         ]
@@ -193,7 +250,6 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
             def _patch(row, portal=portal):
                 r = dict(row)
                 r["Nama panjang"] = portal["outlet"]
-                r["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                 if portal["store_id"]:
                     r["Store ID"] = portal["store_id"]
                 return r
@@ -302,6 +358,8 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
         log.info(f"  Total Baris Item     : {len(master_items):,}")
         log.info(f"  Total Baris Modifier : {len(master_mods):,}")
 
+        check_and_upload_gdrive(master_item_xlsx, master_mod_xlsx, portals)
+
         return  # selesai, skip Playwright mode
 
     log.info("="*60)
@@ -394,7 +452,6 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                             if target_clean in item_clean or item_clean in target_clean:
                                 item_copy = dict(item)
                                 item_copy["Nama panjang"] = portal["outlet"]
-                                item_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     item_copy["Store ID"] = portal["store_id"]
                                 matched_items.append(item_copy)
@@ -404,7 +461,6 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                             if target_clean in mod_clean or mod_clean in target_clean:
                                 mod_copy = dict(mod)
                                 mod_copy["Nama panjang"] = portal["outlet"]
-                                mod_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     mod_copy["Store ID"] = portal["store_id"]
                                 matched_modifiers.append(mod_copy)
@@ -413,14 +469,12 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                             for item in items:
                                 item_copy = dict(item)
                                 item_copy["Nama panjang"] = portal["outlet"]
-                                item_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     item_copy["Store ID"] = portal["store_id"]
                                 matched_items.append(item_copy)
                             for mod in modifiers:
                                 mod_copy = dict(mod)
                                 mod_copy["Nama panjang"] = portal["outlet"]
-                                mod_copy["Nama pendek (ShopeeFood)"] = portal["shopee_short"]
                                 if portal["store_id"]:
                                     mod_copy["Store ID"] = portal["store_id"]
                                 matched_modifiers.append(mod_copy)
@@ -437,14 +491,14 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                         df_mods = pd.DataFrame(matched_modifiers)
                         
                         item_cols = [
-                            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
+                            "Link outlet", "Nama panjang", "Store ID",
                             "Nama kategori", "Nama item", "Jumlah terjual", "Jumlah modifier group",
                             "Jumlah modifier", "Deskripsi item", "Harga item sebelum promo (harga coret)",
                             "Harga item setelah promo (harga coret)", "Nominal atau persentase promo (harga coret)",
                             "Ketersediaan item", "Link foto"
                         ]
                         mod_cols = [
-                            "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
+                            "Link outlet", "Nama panjang", "Store ID",
                             "Nama item", "Nama modifier group", "Nama modifier", "Tipe modifier",
                             "Minimal", "Maksimal", "Harga modifier", "Ketersediaan modifier"
                         ]
@@ -575,14 +629,14 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
 
     # Combine
     item_cols = [
-        "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
+        "Link outlet", "Nama panjang", "Store ID",
         "Nama kategori", "Nama item", "Jumlah terjual", "Jumlah modifier group",
         "Jumlah modifier", "Deskripsi item", "Harga item sebelum promo (harga coret)",
         "Harga item setelah promo (harga coret)", "Nominal atau persentase promo (harga coret)",
         "Ketersediaan item", "Link foto"
     ]
     mod_cols = [
-        "Link outlet", "Nama panjang", "Nama pendek (ShopeeFood)", "Store ID",
+        "Link outlet", "Nama panjang", "Store ID",
         "Nama item", "Nama modifier group", "Nama modifier", "Tipe modifier",
         "Minimal", "Maksimal", "Harga modifier", "Ketersediaan modifier"
     ]
@@ -605,6 +659,8 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
     log.info(f"✓ Laporan Master Excel Gabungan: {master_item_xlsx} & {master_mod_xlsx}")
     log.info(f"  Total Baris Item     : {len(master_items):,}")
     log.info(f"  Total Baris Modifier : {len(master_mods):,}")
+
+    check_and_upload_gdrive(master_item_xlsx, master_mod_xlsx, portals)
 
     if ENABLE_GSHEETS_PUSH:
         log.info("\n📤 [PROGRESS] Distribusi ke Google Sheets (Menu) tidak didukung dalam integrasi baru ini. Melewati.")

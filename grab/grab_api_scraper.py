@@ -631,7 +631,6 @@ def parse_menu(menu_data, store_id, outlet_name, shopee_short_name):
                     modifiers_list.append({
                         "Link outlet": f"https://food.grab.com/id/en/restaurant/{store_id}",
                         "Nama panjang": outlet_name,
-                        "Nama pendek (ShopeeFood)": shopee_short_name,
                         "Store ID": store_id,
                         "Nama item": item_name,
                         "Nama modifier group": mg_name,
@@ -648,7 +647,6 @@ def parse_menu(menu_data, store_id, outlet_name, shopee_short_name):
             items_list.append({
                 "Link outlet": f"https://food.grab.com/id/en/restaurant/{store_id}",
                 "Nama panjang": outlet_name,
-                "Nama pendek (ShopeeFood)": shopee_short_name,
                 "Store ID": store_id,
                 "Nama kategori": cat_name,
                 "Nama item": item_name,
