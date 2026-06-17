@@ -180,7 +180,7 @@ class GrabAPI:
         results = []
         for m in merchants:
             group_id   = m.get("id")
-            group_name = m.get("name") or m.get("merchantName") or m.get("group_name") or ""
+            group_name = m.get("name") or m.get("merchantName") or m.get("group_name") or m.get("display_name") or ""
             stores = (m.get("stores") or m.get("branches") or
                       m.get("outlets") or m.get("merchantOutlets") or [])
             if stores and isinstance(stores, list):
@@ -197,16 +197,58 @@ class GrabAPI:
                             "store_name": sname,
                         })
             else:
-                # No sub-stores — use group_id as store_id only if it looks like a store ID
-                # (store IDs usually start with a digit or short prefix, group IDs with 'IDMG')
-                if group_id and not str(group_id).startswith("IDMG"):
+                # Jika group_id bertipe MLM/IDMG, coba fetch menu-groups API untuk list cabang
+                if group_id and str(group_id).startswith("IDMG"):
+                    logger.info(f"  [Selector] Group ID {group_id} detected without direct stores. Trying menu-groups API...")
+                    mg_url = "https://api.grab.com/food/merchant/v1/menu-groups?isWithItemPhotoCount=true"
+                    js_code = f"""
+                    async () => {{
+                        try {{
+                            const response = await fetch("{mg_url}", {{
+                                method: "GET",
+                                headers: {{
+                                    "Accept": "application/json",
+                                    "Accept-Language": "en",
+                                    "merchantgroupid": "{group_id}",
+                                    "requestsource": "troyPortal"
+                                }},
+                                credentials: "include"
+                            }});
+                            return {{ status: response.status, data: await response.json() }};
+                        }} catch (e) {{
+                            return {{ status: 0, error: e.toString() }};
+                        }}
+                    }}
+                    """
+                    try:
+                        mg_resp = await self.page.evaluate(js_code)
+                        if mg_resp and mg_resp.get("status") == 200:
+                            mg_data = mg_resp.get("data", {})
+                            menu_groups = mg_data.get("menuGroups") or mg_data.get("groups") or []
+                            logger.info(f"  [Selector] Ditemukan {len(menu_groups)} menu group(s) dari API untuk {group_id}")
+                            for mg in menu_groups:
+                                mg_id = mg.get("menuGroupID") or mg.get("id")
+                                mg_name = mg.get("name") or mg.get("groupName") or mg.get("menuGroupName") or group_name
+                                if mg_id:
+                                    results.append({
+                                        "group_id": group_id,
+                                        "group_name": group_name,
+                                        "store_id": mg_id,
+                                        "store_name": mg_name,
+                                        "is_menu_group": True
+                                    })
+                        else:
+                            logger.warning(f"  [Selector] menu-groups API returned status {mg_resp.get('status') if mg_resp else 'None'}")
+                    except Exception as e:
+                        logger.warning(f"  [Selector] Failed to evaluate menu-groups: {e}")
+                
+                if not results and group_id and not str(group_id).startswith("IDMG"):
                     results.append({
                         "group_id": group_id,
                         "group_name": group_name,
                         "store_id": group_id,
                         "store_name": group_name,
                     })
-                # else: skip — we can't use IDMG as merchantid
         return results
 
     async def get_merchant_ids_from_page_requests(self):
@@ -262,10 +304,161 @@ class GrabAPI:
         return captured
 
 
-    async def fetch_menu(self, group_id, store_id):
-        """GET /food/merchant/v2/menu — dipanggil dari konteks halaman /food/menu"""
-        url = "https://api.grab.com/food/merchant/v2/menu"
+    async def fetch_menu(self, group_id, store_id, store_name=None, is_menu_group=False):
+        """GET /food/merchant/v2/menu — dipanggil dari konteks halaman /food/menu.
+        Mendukung deteksi otomatis Menu Groups untuk multi-cabang (seperti AGSA).
+        """
+        if is_menu_group:
+            logger.info(f"  [MenuGroups] Direct group menu fetch for store_id/groupID: {store_id}")
+            group_menu_url = f"https://api.grab.com/food/merchant/v2/menu-groups/menu?menuGroupID={store_id}"
+            js_group_menu = f"""
+            async () => {{
+                try {{
+                    const response = await fetch("{group_menu_url}", {{
+                        method: "GET",
+                        headers: {{
+                            "Accept": "application/json",
+                            "Accept-Language": "en",
+                            "merchantgroupid": "{group_id}",
+                            "requestsource": "troyPortal"
+                        }},
+                        credentials: "include"
+                    }});
+                    const status = response.status;
+                    const text = await response.text();
+                    try {{
+                        return {{ status, data: JSON.parse(text) }};
+                    }} catch (e) {{
+                        return {{ status, data: text }};
+                    }}
+                }} catch (e) {{
+                    return {{ status: 0, error: e.toString() }};
+                }}
+            }}
+            """
+            for attempt in range(3):
+                try:
+                    res = await self.page.evaluate(js_group_menu)
+                    if res and res.get("status") == 200:
+                        return res.get("data", {}), None
+                    err = res.get("error") or f"Status {res.get('status')}: {res.get('data')}"
+                    logger.warning(f"Attempt {attempt+1} to fetch group menu failed: {err}")
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt+1} to evaluate fetch group menu failed: {e}")
+                    await asyncio.sleep(2)
+                    
+            return None, "Failed to retrieve group menu after 3 attempts"
+
+        # Coba deteksi menu groups terlebih dahulu
+        menu_groups_url = "https://api.grab.com/food/merchant/v1/menu-groups?isWithItemPhotoCount=true"
+        js_menu_groups = f"""
+        async () => {{
+            try {{
+                const response = await fetch("{menu_groups_url}", {{
+                    method: "GET",
+                    headers: {{
+                        "Accept": "application/json",
+                        "Accept-Language": "en",
+                        "merchantgroupid": "{group_id}",
+                        "requestsource": "troyPortal"
+                    }},
+                    credentials: "include"
+                }});
+                const status = response.status;
+                const text = await response.text();
+                try {{
+                    return {{ status, data: JSON.parse(text) }};
+                }} catch (e) {{
+                    return {{ status, data: text }};
+                }}
+            }} catch (e) {{
+                return {{ status: 0, error: e.toString() }};
+            }}
+        }}
+        """
         
+        try:
+            mg_res = await self.page.evaluate(js_menu_groups)
+            if mg_res and mg_res.get("status") == 200:
+                mg_data = mg_res.get("data", {})
+                menu_groups = mg_data.get("menuGroups") or mg_data.get("groups") or []
+                if menu_groups and isinstance(menu_groups, list):
+                    logger.info(f"  [MenuGroups] Ditemukan {len(menu_groups)} menu group(s) untuk group_id {group_id}")
+                    
+                    # Cari group yang cocok dengan store_name
+                    matched_group = None
+                    if store_name:
+                        def clean_str(s):
+                            return "".join(c for c in str(s).lower() if c.isalnum())
+                        
+                        target_clean = clean_str(store_name)
+                        for g in menu_groups:
+                            g_name = g.get("name") or g.get("groupName") or g.get("menuGroupName") or ""
+                            if clean_str(g_name) == target_clean:
+                                matched_group = g
+                                break
+                        if not matched_group:
+                            # Substring match
+                            for g in menu_groups:
+                                g_name = g.get("name") or g.get("groupName") or g.get("menuGroupName") or ""
+                                cg = clean_str(g_name)
+                                if cg and target_clean and (cg in target_clean or target_clean in cg):
+                                    matched_group = g
+                                    break
+                    
+                    if not matched_group:
+                        matched_group = menu_groups[0]
+                        logger.warning(f"  [MenuGroups] Tidak ditemukan kecocokan persis untuk '{store_name}'. Menggunakan group pertama: '{matched_group.get('name')}'")
+                    
+                    menu_group_id = matched_group.get("menuGroupID") or matched_group.get("id")
+                    if menu_group_id:
+                        logger.info(f"  [MenuGroups] Mengambil menu group: '{matched_group.get('name')}' (ID: {menu_group_id})")
+                        group_menu_url = f"https://api.grab.com/food/merchant/v2/menu-groups/menu?menuGroupID={menu_group_id}"
+                        
+                        js_group_menu = f"""
+                        async () => {{
+                            try {{
+                                const response = await fetch("{group_menu_url}", {{
+                                    method: "GET",
+                                    headers: {{
+                                        "Accept": "application/json",
+                                        "Accept-Language": "en",
+                                        "merchantgroupid": "{group_id}",
+                                        "requestsource": "troyPortal"
+                                    }},
+                                    credentials: "include"
+                                }});
+                                const status = response.status;
+                                const text = await response.text();
+                                try {{
+                                    return {{ status, data: JSON.parse(text) }};
+                                }} catch (e) {{
+                                    return {{ status, data: text }};
+                                }}
+                            }} catch (e) {{
+                                return {{ status: 0, error: e.toString() }};
+                            }}
+                        }}
+                        """
+                        for attempt in range(3):
+                            try:
+                                res = await self.page.evaluate(js_group_menu)
+                                if res and res.get("status") == 200:
+                                    return res.get("data", {}), None
+                                err = res.get("error") or f"Status {res.get('status')}: {res.get('data')}"
+                                logger.warning(f"Attempt {attempt+1} to fetch group menu failed: {err}")
+                                await asyncio.sleep(2)
+                            except Exception as e:
+                                logger.warning(f"Attempt {attempt+1} to evaluate fetch group menu failed: {e}")
+                                await asyncio.sleep(2)
+                                
+                        return None, "Failed to retrieve group menu after 3 attempts"
+        except Exception as ex:
+            logger.debug(f"Menu groups check failed or not supported: {ex}. Proceeding to standard fetch.")
+
+        # Fallback ke alur standard jika bukan Menu Groups
+        url = "https://api.grab.com/food/merchant/v2/menu"
         js_code = f"""
         async () => {{
             try {{
@@ -782,9 +975,10 @@ async def run_api_download_for_portal(user, pwd, start_date: str = None, end_dat
                 store_id   = s["store_id"]
                 group_id   = s["group_id"]
                 store_name = s["store_name"]
+                is_mg      = s.get("is_menu_group", False)
 
-                # Jika multi-store, navigasi ke food/menu tiap store
-                if len(stores) > 1:
+                # Jika multi-store, navigasi ke food/menu tiap store (skip jika is_menu_group)
+                if len(stores) > 1 and not is_mg:
                     try:
                         await page.goto(
                             "https://merchant.grab.com/food/menu",
@@ -797,7 +991,7 @@ async def run_api_download_for_portal(user, pwd, start_date: str = None, end_dat
 
                 # Step 3: Fetch menu dari konteks halaman /food/menu
                 logger.info(f"  [Fetch] Fetching menu API for {store_name} ({store_id})...")
-                menu_data, err = await api.fetch_menu(group_id, store_id)
+                menu_data, err = await api.fetch_menu(group_id, store_id, store_name, is_mg)
                 if menu_data:
                     items, modifiers = parse_menu(menu_data, store_id, store_name, "")
                     all_items.extend(items)
@@ -867,7 +1061,7 @@ def get_merchants_via_cookie(cookie_str: str):
             results = []
             for m in merchants:
                 group_id = m.get("id")
-                group_name = m.get("name")
+                group_name = m.get("name") or m.get("merchantName") or m.get("group_name") or m.get("display_name") or ""
                 stores = m.get("stores") or m.get("branches") or m.get("outlets")
                 if stores and isinstance(stores, list):
                     for s in stores:
@@ -878,12 +1072,38 @@ def get_merchants_via_cookie(cookie_str: str):
                             "store_name": s.get("name"),
                         })
                 else:
-                    results.append({
-                        "group_id": group_id,
-                        "group_name": group_name,
-                        "store_id": group_id,
-                        "store_name": group_name,
-                    })
+                    if group_id and str(group_id).startswith("IDMG"):
+                        logger.info(f"  [Cookie Mode Selector] Group ID {group_id} detected without direct stores. Trying menu-groups API...")
+                        mg_url = "https://api.grab.com/food/merchant/v1/menu-groups?isWithItemPhotoCount=true"
+                        headers_mg = dict(headers)
+                        headers_mg["merchantgroupid"] = group_id
+                        try:
+                            mg_resp = _req.get(mg_url, headers=headers_mg, timeout=30)
+                            if mg_resp.status_code == 200:
+                                mg_data = mg_resp.json()
+                                menu_groups = mg_data.get("menuGroups") or mg_data.get("groups") or []
+                                logger.info(f"  [Cookie Mode Selector] Ditemukan {len(menu_groups)} menu group(s) dari API")
+                                for mg in menu_groups:
+                                    mg_id = mg.get("menuGroupID") or mg.get("id")
+                                    mg_name = mg.get("name") or mg.get("groupName") or mg.get("menuGroupName") or group_name
+                                    if mg_id:
+                                        results.append({
+                                            "group_id": group_id,
+                                            "group_name": group_name,
+                                            "store_id": mg_id,
+                                            "store_name": mg_name,
+                                            "is_menu_group": True
+                                        })
+                        except Exception as e:
+                            logger.warning(f"  [Cookie Mode Selector] menu-groups fetch exception: {e}")
+                    
+                    if not results:
+                        results.append({
+                            "group_id": group_id,
+                            "group_name": group_name,
+                            "store_id": group_id,
+                            "store_name": group_name,
+                        })
             return results, None
         else:
             return [], f"merchant-selector returned status {resp.status_code}: {resp.text[:300]}"
@@ -891,12 +1111,111 @@ def get_merchants_via_cookie(cookie_str: str):
         return [], str(e)
 
 
-def fetch_menu_via_cookie(cookie_str: str, group_id: str, store_id: str):
+def fetch_menu_via_cookie(cookie_str: str, group_id: str, store_id: str, store_name: str = None, is_menu_group=False):
     """
     Fetch menu untuk satu store via cookie menggunakan requests.
-    Referer disetel ke /food/menu sesuai alur manual browser.
+    Mendukung deteksi otomatis Menu Groups untuk multi-cabang (seperti AGSA).
     """
     import requests as _req
+    
+    if is_menu_group:
+        logger.info(f"  [Cookie Mode MenuGroups] Direct group menu fetch for store_id/groupID: {store_id}")
+        group_menu_url = f"https://api.grab.com/food/merchant/v2/menu-groups/menu?menuGroupID={store_id}"
+        headers_mg = {
+            "Accept": "application/json",
+            "Accept-Language": "en",
+            "Cookie": cookie_str,
+            "merchantgroupid": group_id,
+            "Origin": "https://merchant.grab.com",
+            "Referer": "https://merchant.grab.com/food/menu",
+            "requestsource": "troyPortal",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+        }
+        for attempt in range(3):
+            try:
+                resp_gm = _req.get(group_menu_url, headers=headers_mg, timeout=30)
+                if resp_gm.status_code == 200:
+                    return resp_gm.json(), None
+                err = f"Status {resp_gm.status_code}: {resp_gm.text[:300]}"
+                logger.warning(f"  [Cookie Mode] Attempt {attempt+1} fetch group menu failed: {err}")
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"  [Cookie Mode] Attempt {attempt+1} fetch group menu exception: {e}")
+                time.sleep(2)
+                
+        return None, "fetch_group_menu_via_cookie failed after 3 attempts"
+
+    # 1. Coba cek menu groups terlebih dahulu
+    menu_groups_url = "https://api.grab.com/food/merchant/v1/menu-groups?isWithItemPhotoCount=true"
+    headers_mg = {
+        "Accept": "application/json",
+        "Accept-Language": "en",
+        "Cookie": cookie_str,
+        "merchantgroupid": group_id,
+        "Origin": "https://merchant.grab.com",
+        "Referer": "https://merchant.grab.com/food/menu",
+        "requestsource": "troyPortal",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+    }
+    try:
+        resp = _req.get(menu_groups_url, headers=headers_mg, timeout=30)
+        if resp.status_code == 200:
+            mg_data = resp.json()
+            menu_groups = mg_data.get("menuGroups") or mg_data.get("groups") or []
+            if menu_groups and isinstance(menu_groups, list):
+                logger.info(f"  [Cookie Mode] Ditemukan {len(menu_groups)} menu group(s) untuk group_id {group_id}")
+                
+                matched_group = None
+                if store_name:
+                    def clean_str(s):
+                        return "".join(c for c in str(s).lower() if c.isalnum())
+                    
+                    target_clean = clean_str(store_name)
+                    for g in menu_groups:
+                        g_name = g.get("name") or g.get("groupName") or g.get("menuGroupName") or ""
+                        if clean_str(g_name) == target_clean:
+                            matched_group = g
+                            break
+                    if not matched_group:
+                        for g in menu_groups:
+                            g_name = g.get("name") or g.get("groupName") or g.get("menuGroupName") or ""
+                            cg = clean_str(g_name)
+                            if cg and target_clean and (cg in target_clean or target_clean in cg):
+                                matched_group = g
+                                break
+                                
+                if not matched_group:
+                    matched_group = menu_groups[0]
+                    logger.warning(f"  [Cookie Mode] Tidak ditemukan kecocokan persis untuk '{store_name}'. Menggunakan group pertama: '{matched_group.get('name')}'")
+                
+                menu_group_id = matched_group.get("menuGroupID") or matched_group.get("id")
+                if menu_group_id:
+                    logger.info(f"  [Cookie Mode] Mengambil menu group: '{matched_group.get('name')}' (ID: {menu_group_id})")
+                    group_menu_url = f"https://api.grab.com/food/merchant/v2/menu-groups/menu?menuGroupID={menu_group_id}"
+                    
+                    for attempt in range(3):
+                        try:
+                            resp_gm = _req.get(group_menu_url, headers=headers_mg, timeout=30)
+                            if resp_gm.status_code == 200:
+                                return resp_gm.json(), None
+                            err = f"Status {resp_gm.status_code}: {resp_gm.text[:300]}"
+                            logger.warning(f"  [Cookie Mode] Attempt {attempt+1} fetch group menu failed: {err}")
+                            time.sleep(2)
+                        except Exception as e:
+                            logger.warning(f"  [Cookie Mode] Attempt {attempt+1} fetch group menu exception: {e}")
+                            time.sleep(2)
+                            
+                    return None, "fetch_group_menu_via_cookie failed after 3 attempts"
+    except Exception as ex:
+        logger.debug(f"Cookie Mode menu groups check failed: {ex}. Proceeding to standard fetch.")
+
+    # Fallback ke alur standard jika bukan Menu Groups
     url = "https://api.grab.com/food/merchant/v2/menu"
     headers = {
         "Accept": "application/json",
@@ -951,7 +1270,7 @@ def run_cookie_download(cookie_str: str):
         store_name = s.get("store_name") or s.get("group_name") or store_id
 
         logger.info(f"  [Cookie Mode] Fetching menu: {store_name} ({store_id})...")
-        menu_data, err = fetch_menu_via_cookie(cookie_str, group_id, store_id)
+        menu_data, err = fetch_menu_via_cookie(cookie_str, group_id, store_id, store_name, s.get("is_menu_group", False))
         if menu_data:
             items, modifiers = parse_menu(menu_data, store_id, store_name, "")
             all_items.extend(items)
