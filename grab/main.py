@@ -323,9 +323,11 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
     from playwright.async_api import async_playwright
     
     async with async_playwright() as p:
-        # Load headless setting and concurrency from config.json walk-up
+        # Load settings from config.json walk-up
         headless_env = True
         concurrency_limit = 3
+        batch_size = 5
+        batch_delay = 5
         try:
             import json
             for parent in Path(__file__).resolve().parents:
@@ -335,6 +337,8 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                         config_data = json.load(f)
                         headless_env = config_data.get("headless_grab", True)
                         concurrency_limit = config_data.get("max_concurrency", 3)
+                        batch_size = config_data.get("batch_size", 5)
+                        batch_delay = config_data.get("batch_delay", 5)
                     break
         except Exception:
             pass
@@ -471,8 +475,25 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                 except Exception as e:
                     log.error(f"  ✗ [ACCOUNT] {username} CRITICAL ERROR: {str(e)}")
 
-        tasks = [process_user(u, info) for u, info in unique_users.items()]
-        await asyncio.gather(*tasks)
+        unique_users_list = list(unique_users.items())
+        # Jika total akun sedikit, tidak perlu batching besar
+        if len(unique_users_list) <= batch_size:
+            tasks = [process_user(u, info) for u, info in unique_users_list]
+            await asyncio.gather(*tasks)
+        else:
+            log.info(f"⚡ Memproses {len(unique_users_list)} akun dalam batch berukuran {batch_size} dengan jeda {batch_delay} detik...")
+            for idx in range(0, len(unique_users_list), batch_size):
+                batch = unique_users_list[idx:idx+batch_size]
+                batch_num = (idx // batch_size) + 1
+                total_batches = (len(unique_users_list) + batch_size - 1) // batch_size
+                log.info(f"▶ [BATCH {batch_num}/{total_batches}] Memulai {len(batch)} akun...")
+                
+                batch_tasks = [process_user(u, info) for u, info in batch]
+                await asyncio.gather(*batch_tasks)
+                
+                if idx + batch_size < len(unique_users_list):
+                    log.info(f"⏸️ Menunggu {batch_delay} detik untuk mendinginkan sesi agar tidak diblokir...")
+                    await asyncio.sleep(batch_delay)
         
         # --- Sequential Retry for Failed Accounts ---
         if failures:

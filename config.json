@@ -1,4 +1,6 @@
 {
   "headless_grab": true,
-  "max_concurrency": 3
+  "max_concurrency": 3,
+  "batch_size": 5,
+  "batch_delay": 5
 }
