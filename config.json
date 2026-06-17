@@ -1,0 +1,4 @@
+{
+  "headless_grab": true,
+  "max_concurrency": 3
+}

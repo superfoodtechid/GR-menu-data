@@ -1,0 +1,980 @@
+import os
+import json
+import asyncio
+import time
+import uuid
+from datetime import datetime, timedelta
+from playwright.async_api import async_playwright
+from dotenv import load_dotenv
+try:
+    from filelock import FileLock
+except ImportError:
+    import contextlib
+    class FileLock:
+        def __init__(self, path, timeout=-1): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        @contextlib.contextmanager
+        def acquire(self, *a, **kw): yield
+
+load_dotenv(override=True)
+
+import logging
+
+logger = logging.getLogger("GrabAuto")
+
+class SessionStuckError(Exception):
+    """Custom exception when API calls are stuck due to persistent network errors"""
+    pass
+
+class IncorrectCredentialsError(Exception):
+    """Custom exception when login fails due to wrong username or password"""
+    pass
+
+
+import re
+
+def validate_credentials(username, password):
+    """
+    Smarter and stricter credential validation to catch common human errors.
+    Returns (is_valid, error_message)
+    """
+    if not username or not password:
+        return False, "Username or password is empty"
+        
+    u = str(username).strip().replace('\xa0', '')
+    p = str(password).strip().replace('\xa0', '')
+    
+    if not u or not p:
+        return False, "Username or password contains only whitespace"
+        
+    placeholders = {'-', '--', 'null', 'none', 'n/a', 'na', 'sandi', 'password', 'username', 'pengguna'}
+    if u.lower() in placeholders or p.lower() in placeholders:
+        return False, f"Credential contains a placeholder value (user: '{u}', pwd: '{p}')"
+        
+    if u.lower() == p.lower():
+        return False, f"Username and Password are identical (likely copy-paste error): '{u}'"
+        
+    if len(p) < 6:
+        return False, f"Password is too short (less than 6 characters): '{p}'"
+        
+    email_pattern = r'[^@\s]+@[^@\s]+\.[^@\s]+'
+    if re.search(email_pattern, p):
+        return False, f"Password looks like an email address (likely copy-paste or swap error): '{p}'"
+        
+    if p.lower().endswith('superfood') and len(p) > 10:
+        return False, f"Password looks like a Superfood merchant username (ends with 'superfood'): '{p}'"
+        
+    return True, ""
+
+
+class GrabAPI:
+    def __init__(self, page, username, password):
+        self.page = page
+        self.username = username
+        self.password = password
+        self.base_url = "https://merchant.grab.com"
+
+    async def call_api(self, url, method="GET", params=None):
+        """Call Grab API from within the page context to reuse session/headers"""
+        full_url = url
+        if params and method == "GET":
+            query = "&".join([f"{k}={v}" for k, v in params.items()])
+            full_url = f"{url}?{query}" if "?" not in url else f"{url}&{query}"
+        
+        js_code = f"""
+        async () => {{
+            try {{
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000);
+                
+                const response = await fetch("{full_url}", {{
+                    method: "{method}",
+                    signal: controller.signal,
+                    headers: {{
+                        "Accept": "application/json",
+                        "Content-Type": "application/json"
+                    }}
+                }});
+                clearTimeout(timeoutId);
+                const status = response.status;
+                const text = await response.text();
+                try {{
+                    return {{ status, data: JSON.parse(text) }};
+                }} catch (e) {{
+                    return {{ status, data: text }};
+                }}
+            }} catch (e) {{
+                return {{ status: 0, error: e.toString() }};
+            }}
+        }}
+        """
+        
+        for attempt in range(5):
+            try:
+                if self.page.is_closed():
+                    return {"status": 0, "error": "Page closed"}
+                
+                res = await self.page.evaluate(js_code)
+                
+                if res is None:
+                    res = {"status": 0, "error": "Evaluation returned None"}
+
+                if res.get("status") == 0 and res.get("error"):
+                    err_msg = res["error"].lower()
+                    if "failed to fetch" in err_msg or "networkerror" in err_msg or "aborted" in err_msg:
+                        if attempt < 4:
+                            logger.info(f"  [Retry] Network error detected in JS fetch, retrying... ({attempt+1})")
+                            try:
+                                os.makedirs("logs", exist_ok=True)
+                                ss_path = f"logs/net_error_{self.username}_try{attempt+1}.png"
+                                await self.page.screenshot(path=ss_path)
+                            except: pass
+                            await asyncio.sleep(3)
+                            continue
+                        else:
+                            raise SessionStuckError(f"Network stuck for {self.username} after 5 attempts")
+                
+                return res
+            except SessionStuckError:
+                raise
+            except Exception as e:
+                err_msg = str(e).lower()
+                if ("context was destroyed" in err_msg or "navigation" in err_msg or "network" in err_msg) and attempt < 4:
+                    logger.info(f"  [Retry] Playwright execution error, retrying API call... ({attempt+1})")
+                    await asyncio.sleep(2)
+                    continue
+                return {"status": 0, "error": str(e)}
+        
+        return {"status": 0, "error": "Max retries reached without successful response"}
+
+    async def get_merchant_group_id(self):
+        """GET /troy/user-profile/v1/merchant-selector"""
+        url = f"{self.base_url}/troy/user-profile/v1/merchant-selector"
+        resp = await self.call_api(url)
+        status = resp.get("status")
+        if status == 200:
+            data = resp.get("data", {})
+            merchants = data.get("merchants", [])
+            if merchants:
+                mgid = merchants[0].get("id")
+                return mgid
+        else:
+            logger.warning(f"  [API] merchant-selector returned status {status}: {str(resp.get('data'))[:100]}")
+        return None
+
+    async def get_all_merchants_and_stores(self):
+        """Get all merchant groups and their store list from the selector.
+        Tries multiple field name variants for robustness.
+        """
+        url = f"{self.base_url}/troy/user-profile/v1/merchant-selector"
+        resp = await self.call_api(url)
+        if resp.get("status") != 200:
+            logger.error(f"Failed to fetch merchant-selector: {resp.get('error') or resp.get('status')}")
+            return []
+
+        data = resp.get("data", {})
+        merchants = data.get("merchants", [])
+        logger.info(f"  [Selector] Raw merchant-selector: {len(merchants)} merchant(s). Sample: {str(merchants[:1])[:300]}")
+
+        results = []
+        for m in merchants:
+            group_id   = m.get("id")
+            group_name = m.get("name") or m.get("merchantName") or m.get("group_name") or ""
+            stores = (m.get("stores") or m.get("branches") or
+                      m.get("outlets") or m.get("merchantOutlets") or [])
+            if stores and isinstance(stores, list):
+                for s in stores:
+                    sid = (s.get("id") or s.get("storeId") or s.get("store_id")
+                           or s.get("merchantId") or s.get("outletId"))
+                    sname = (s.get("name") or s.get("storeName") or s.get("store_name")
+                             or s.get("outletName") or group_name)
+                    if sid:
+                        results.append({
+                            "group_id": group_id,
+                            "group_name": group_name,
+                            "store_id": sid,
+                            "store_name": sname,
+                        })
+            else:
+                # No sub-stores — use group_id as store_id only if it looks like a store ID
+                # (store IDs usually start with a digit or short prefix, group IDs with 'IDMG')
+                if group_id and not str(group_id).startswith("IDMG"):
+                    results.append({
+                        "group_id": group_id,
+                        "group_name": group_name,
+                        "store_id": group_id,
+                        "store_name": group_name,
+                    })
+                # else: skip — we can't use IDMG as merchantid
+        return results
+
+    async def get_merchant_ids_from_page_requests(self):
+        """
+        Navigasi ke /food/menu dan intercept request halaman ke
+        api.grab.com/food/merchant/v2/menu untuk mendapatkan merchantId/merchantgroupid.
+        Jika halaman cache (tidak membuat request baru), paksa reload.
+        """
+        captured = []
+        seen_ids = set()
+
+        def on_request(request):
+            if "food/merchant/v2/menu" in request.url:
+                hdrs = request.headers
+                sid  = hdrs.get("merchantid")      or hdrs.get("merchantId")
+                gid  = hdrs.get("merchantgroupid") or hdrs.get("merchantGroupId")
+                if sid and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    captured.append({"store_id": sid, "group_id": gid or sid})
+                    logger.info(f"  [Intercept] merchantid={sid}, merchantgroupid={gid}")
+
+        self.page.on("request", on_request)
+        try:
+            # Navigasi pertama
+            await self.page.goto(
+                "https://merchant.grab.com/food/menu",
+                wait_until="networkidle",
+                timeout=30000
+            )
+            await self.page.wait_for_timeout(3000)
+
+            # Jika halaman loaded dari cache → paksa reload
+            if not captured:
+                logger.info("  [Intercept] No requests caught (likely cached). Forcing reload...")
+                await self.page.reload(wait_until="networkidle", timeout=30000)
+                await self.page.wait_for_timeout(4000)
+
+            # Fallback: cek URL apakah mengandung store ID
+            # (beberapa versi portal redirect ke /food/menu/{storeId})
+            if not captured:
+                current_url = self.page.url
+                if "/food/menu/" in current_url:
+                    sid = current_url.split("/food/menu/")[-1].split("?")[0].split("/")[0]
+                    if sid and sid != "menu":
+                        logger.info(f"  [Intercept] merchantid={sid} extracted from URL: {current_url}")
+                        captured.append({"store_id": sid, "group_id": sid})
+
+        except Exception as e:
+            logger.warning(f"  [Intercept] Navigation/reload failed: {e}")
+        finally:
+            self.page.remove_listener("request", on_request)
+
+        return captured
+
+
+    async def fetch_menu(self, group_id, store_id):
+        """GET /food/merchant/v2/menu — dipanggil dari konteks halaman /food/menu"""
+        url = "https://api.grab.com/food/merchant/v2/menu"
+        
+        js_code = f"""
+        async () => {{
+            try {{
+                const response = await fetch("{url}", {{
+                    method: "GET",
+                    headers: {{
+                        "Accept": "application/json",
+                        "Accept-Language": "en",
+                        "merchantgroupid": "{group_id}",
+                        "merchantid": "{store_id}",
+                        "requestsource": "troyPortal"
+                    }},
+                    credentials: "include"
+                }});
+                const status = response.status;
+                const text = await response.text();
+                try {{
+                    return {{ status, data: JSON.parse(text) }};
+                }} catch (e) {{
+                    return {{ status, data: text }};
+                }}
+            }} catch (e) {{
+                return {{ status: 0, error: e.toString() }};
+            }}
+        }}
+        """
+        for attempt in range(3):
+            try:
+                res = await self.page.evaluate(js_code)
+                if res and res.get("status") == 200:
+                    return res.get("data", {}), None
+                err = res.get("error") or f"Status {res.get('status')}: {res.get('data')}"
+                logger.warning(f"Attempt {attempt+1} to fetch menu failed: {err}")
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.warning(f"Attempt {attempt+1} to evaluate fetch_menu failed: {e}")
+                await asyncio.sleep(2)
+                
+        return None, "Failed to retrieve menu after 3 attempts"
+
+async def perform_login(page, user, pwd):
+    """Robust login steps — clears cookies on mismatch and handles sticky 'Welcome back' pages."""
+    CLEAN_LOGIN_URL = (
+        "https://weblogin.grab.com/merchant/login"
+        "?service_id=MEXUSERS&redirect=https%3A%2F%2Fmerchant.grab.com%2Fportal"
+    )
+    
+    import random
+    stagger = random.uniform(1.0, 5.0)
+    await asyncio.sleep(stagger)
+    try:
+        async def check_block_and_errors():
+            block_texts = [
+                "temporarily blocked due to multiple invalid login attempts",
+                "try again later",
+                "coba lagi nanti",
+                "diblokir sementara"
+            ]
+            page_content = await page.content()
+            for text in block_texts:
+                if text.lower() in page_content.lower():
+                    os.makedirs("logs", exist_ok=True)
+                    ss_path = f"logs/account_blocked_{user}.png"
+                    await page.screenshot(path=ss_path)
+                    logger.error(f"  ✗ [Login] Account blocked screen detected for {user}. Screenshot saved to {ss_path}.")
+                    raise IncorrectCredentialsError(f"Account is temporarily blocked due to multiple invalid login attempts.")
+
+            error_texts = [
+                "Make sure you have the right username",
+                "attempts left",
+                "Pastikan nama pengguna dan kata sandi",
+                "kesempatan tersisa",
+                "salah memasukkan password"
+            ]
+            for text in error_texts:
+                if text.lower() in page_content.lower():
+                    os.makedirs("logs", exist_ok=True)
+                    ss_path = f"logs/incorrect_credentials_{user}.png"
+                    await page.screenshot(path=ss_path)
+                    logger.error(f"  ✗ [Login] Wrong credentials error screen detected for {user}. Screenshot saved to {ss_path}.")
+                    raise IncorrectCredentialsError(f"Incorrect username or password. Remaining attempts warning shown on page.")
+
+        print(f"  [Login] Navigating to login page for {user}...")
+        for attempt in range(3):
+            try:
+                await page.goto(CLEAN_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+                break
+            except Exception as nav_err:
+                if attempt < 2:
+                    logger.info(f"  [Login] Navigation error ({nav_err}), retrying... ({attempt+1})")
+                    await asyncio.sleep(5)
+                else:
+                    raise nav_err
+
+        await page.wait_for_timeout(3000)
+        await check_block_and_errors()
+
+        content = await page.content()
+        if "Attention Required" in await page.title() or "cloudflare" in content.lower() or "distil" in content.lower():
+            logger.error(f"  ✗ [BLOCK] Detected anti-bot page for {user}.")
+            await page.screenshot(path=f"blocked_{user}.png")
+            return False
+
+        is_saved_accounts = "saved-accounts" in page.url
+        welcome_back_locator = page.locator('h1:has-text("Welcome back"), h2:has-text("Welcome back"), div:has-text("Welcome back")')
+
+        if is_saved_accounts or await welcome_back_locator.count() > 0:
+            content_lower = (await page.content()).lower()
+            if user.lower() in content_lower:
+                logger.info(f"  [Login] Saved account matches {user}, clicking 'Continue'...")
+                continue_btn = page.locator('button:has-text("Continue"), button:has-text("Lanjut")')
+                if await continue_btn.count() > 0:
+                    await continue_btn.first.click()
+                    try:
+                        await page.wait_for_selector('input[type="password"], .dashboard, .portal-content', timeout=10000)
+                    except: pass
+                    
+                    if "login" not in page.url.lower() and "saved-accounts" not in page.url:
+                        return True
+            else:
+                logger.info(f"  [Login] Saved account mismatch for {user}. Clearing cookies for fresh start...")
+                await page.context.clear_cookies()
+                await page.goto(CLEAN_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2000)
+
+        await check_block_and_errors()
+
+        user_selectors = [
+            'input[type="email"]', 'input[name="email"]', 'input[type="text"]',
+            'input[placeholder*="Email" i]', 'input[placeholder*="Username" i]',
+            '#email', '#username',
+        ]
+
+        async def find_username_field():
+            for sel in user_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=5000) and await el.is_enabled():
+                        return el
+                except: continue
+            return None
+
+        user_field = await find_username_field()
+        if not user_field and "saved-accounts" in page.url:
+            await page.goto(CLEAN_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+            user_field = await find_username_field()
+
+        if user_field:
+            for fill_attempt in range(3):
+                await user_field.click()
+                await user_field.fill("")
+                await user_field.fill(user)
+                await page.wait_for_timeout(500)
+                
+                val = await user_field.input_value()
+                if val.strip() == user.strip():
+                    break
+                
+                logger.warning(f"  [Login] Field value mismatch for {user} (got '{val}'), using keyboard simulation... ({fill_attempt+1})")
+                await user_field.click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await page.keyboard.type(user, delay=50)
+                await page.wait_for_timeout(500)
+                
+                val = await user_field.input_value()
+                if val.strip() == user.strip():
+                    break
+                await page.wait_for_timeout(1000)
+
+            continue_btn = page.locator('button:has-text("Continue"), button:has-text("Lanjut")').first
+            if await continue_btn.count() > 0 and await continue_btn.is_visible():
+                await continue_btn.click()
+            else:
+                await page.keyboard.press("Enter")
+            await page.wait_for_timeout(2500)
+
+            await check_block_and_errors()
+
+        pwd_selector = 'input[type="password"], #password'
+        try:
+            await page.wait_for_selector(pwd_selector, timeout=15000)
+        except:
+            continue_btns = page.locator('button:has-text("Continue"), button:has-text("Next"), button:has-text("Lanjut")')
+            if await continue_btns.count() > 0:
+                await continue_btns.first.click()
+                try: await page.wait_for_selector(pwd_selector, timeout=10000)
+                except: pass
+        
+        await check_block_and_errors()
+
+        if await page.locator(pwd_selector).count() > 0:
+            await page.fill(pwd_selector, pwd)
+            await page.wait_for_timeout(500)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(3000)
+            await check_block_and_errors()
+                    
+            try:
+                await page.wait_for_url(lambda u: "login" not in u.lower() and "saved-accounts" not in u, timeout=20000)
+                await page.wait_for_load_state("networkidle")
+            except: pass
+
+        return "login" not in page.url.lower() and "saved-accounts" not in page.url
+    except IncorrectCredentialsError:
+        raise
+    except Exception as e:
+        logger.error(f"  ✗ [Login] Failed: {e}")
+        return False
+
+def parse_numeric_price(val):
+    if not val:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    val_str = str(val).replace("Rp", "").replace(".", "").replace(",", ".").strip()
+    try:
+        return float(val_str)
+    except ValueError:
+        return 0.0
+
+def parse_menu(menu_data, store_id, outlet_name, shopee_short_name):
+    items_list = []
+    modifiers_list = []
+    
+    # Ambil modifierGroups global
+    global_mod_groups = {}
+    for mg in menu_data.get("modifierGroups", []):
+        mg_id = mg.get("modifierGroupID") or mg.get("id")
+        if mg_id:
+            global_mod_groups[mg_id] = mg
+
+    categories = menu_data.get("categories") or menu_data.get("menu", {}).get("categories") or []
+    
+    for cat in categories:
+        cat_name = cat.get("categoryName") or cat.get("name") or cat.get("title") or "Unknown Category"
+        
+        items = cat.get("items") or cat.get("menuItems") or []
+        for item in items:
+            item_name = item.get("itemName") or item.get("name") or item.get("title") or "Unknown Item"
+            item_desc = item.get("description") or ""
+            
+            # Ketersediaan
+            avail_status = item.get("availableStatus")
+            if avail_status is not None:
+                availability = "Available" if avail_status == 1 else "Sold Out"
+            else:
+                status_val = item.get("status") or item.get("availability") or "AVAILABLE"
+                availability = "Available" if status_val in ("AVAILABLE", 1) else "Sold Out"
+            
+            # Foto
+            photo_url = item.get("imageURL") or ""
+            if not photo_url:
+                images = item.get("imageURLs") or item.get("images") or item.get("photos") or []
+                if images:
+                    first_img = images[0]
+                    if isinstance(first_img, dict):
+                        photo_url = first_img.get("url") or first_img.get("urlLarge") or ""
+                    else:
+                        photo_url = str(first_img)
+            
+            # Harga
+            discounted_price = 0.0
+            if "priceInMin" in item and item["priceInMin"] is not None:
+                discounted_price = float(item["priceInMin"]) / 100.0
+            elif item.get("priceDisplay"):
+                discounted_price = parse_numeric_price(item.get("priceDisplay"))
+            elif item.get("priceRange"):
+                discounted_price = parse_numeric_price(item.get("priceRange"))
+            
+            # Cek jika ada priceInfo (struktur lama)
+            price_info = item.get("priceInfo") or item.get("price") or {}
+            original_price = 0.0
+            if isinstance(price_info, dict) and (price_info.get("price") or price_info.get("originalPrice")):
+                discounted_price = price_info.get("price") or price_info.get("amount") or discounted_price
+                original_price = price_info.get("originalPrice") or price_info.get("original_price") or 0.0
+                
+                # Konversi jika minor unit (sangat besar)
+                try:
+                    discounted_price = float(discounted_price)
+                    if discounted_price > 1000000:
+                        discounted_price = discounted_price / 100.0
+                except: pass
+                try:
+                    original_price = float(original_price)
+                    if original_price > 1000000:
+                        original_price = original_price / 100.0
+                except: pass
+            
+            if original_price == 0.0:
+                original_price = discounted_price
+            
+            # Cek campaign / promo
+            campaign = item.get("itemCampaignInfo")
+            if campaign and isinstance(campaign, dict):
+                promo_price = campaign.get("campaignPrice") or campaign.get("discountedPrice") or campaign.get("price")
+                if promo_price is not None:
+                    promo_price_val = float(promo_price)
+                    if promo_price_val > 1000000 and discounted_price < 100000:
+                        promo_price_val = promo_price_val / 100.0
+                    original_price = discounted_price
+                    discounted_price = promo_price_val
+                else:
+                    discount_amount = campaign.get("discountAmount") or campaign.get("discount")
+                    if discount_amount is not None:
+                        discount_amount_val = float(discount_amount)
+                        if discount_amount_val > 1000000 and discounted_price < 100000:
+                            discount_amount_val = discount_amount_val / 100.0
+                        original_price = discounted_price + discount_amount_val
+            
+            promo_val = original_price - discounted_price
+            if promo_val < 0:
+                promo_val = 0.0
+            
+            # Proses modifier groups (nested atau global)
+            mod_groups = item.get("modifierGroups") or item.get("modifier_groups") or []
+            
+            # Jika tidak ada nested modifier groups, cek linkedModifierGroupIDs
+            linked_ids = item.get("linkedModifierGroupIDs")
+            if not mod_groups and linked_ids:
+                mod_groups = []
+                for mg_id in linked_ids:
+                    if mg_id in global_mod_groups:
+                        mod_groups.append(global_mod_groups[mg_id])
+            
+            num_mod_groups = len(mod_groups)
+            total_mods = 0
+            
+            for mg in mod_groups:
+                mods = mg.get("modifiers") or mg.get("modifierOptions") or mg.get("options") or []
+                total_mods += len(mods)
+                
+                mg_name = mg.get("modifierGroupName") or mg.get("name") or mg.get("title") or "Unknown Modifier Group"
+                mg_min = mg.get("minSelection") or mg.get("min") or 0
+                mg_max = mg.get("maxSelection") or mg.get("max") or 1
+                mg_type = mg.get("selectionType") or ("SINGLE" if mg_max == 1 else "MULTIPLE")
+                
+                for mod in mods:
+                    mod_name = mod.get("modifierName") or mod.get("name") or mod.get("title") or "Unknown Modifier"
+                    
+                    # Harga modifier
+                    mod_price = 0.0
+                    if "priceInMin" in mod and mod["priceInMin"] is not None:
+                        mod_price = float(mod["priceInMin"]) / 100.0
+                    else:
+                        raw_mod_price = mod.get("price") or mod.get("amount") or 0.0
+                        try:
+                            mod_price = float(raw_mod_price)
+                            if mod_price > 1000000:
+                                mod_price = mod_price / 100.0
+                        except:
+                            mod_price = 0.0
+                    
+                    # Status ketersediaan modifier
+                    mod_avail_status = mod.get("availableStatus")
+                    if mod_avail_status is not None:
+                        mod_availability = "Available" if mod_avail_status == 1 else "Sold Out"
+                    else:
+                        mod_status = mod.get("status") or mod.get("availability") or "AVAILABLE"
+                        mod_availability = "Available" if mod_status in ("AVAILABLE", 1) else "Sold Out"
+                    
+                    modifiers_list.append({
+                        "Link outlet": f"https://food.grab.com/id/en/restaurant/{store_id}",
+                        "Nama panjang": outlet_name,
+                        "Store ID": store_id,
+                        "Nama item": item_name,
+                        "Nama modifier group": mg_name,
+                        "Nama modifier": mod_name,
+                        "Tipe modifier": mg_type,
+                        "Minimal": mg_min,
+                        "Maksimal": mg_max,
+                        "Harga modifier": mod_price,
+                        "Ketersediaan modifier": mod_availability
+                    })
+            
+            sold_qty = item.get("soldQuantity") or item.get("soldQty") or item.get("sold_qty") or 0
+            
+            items_list.append({
+                "Link outlet": f"https://food.grab.com/id/en/restaurant/{store_id}",
+                "Nama panjang": outlet_name,
+                "Store ID": store_id,
+                "Nama kategori": cat_name,
+                "Nama item": item_name,
+                "Jumlah terjual": sold_qty,
+                "Jumlah modifier group": num_mod_groups,
+                "Jumlah modifier": total_mods,
+                "Deskripsi item": item_desc,
+                "Harga item sebelum promo (harga coret)": original_price,
+                "Harga item setelah promo (harga coret)": discounted_price,
+                "Nominal atau persentase promo (harga coret)": promo_val,
+                "Ketersediaan item": availability,
+                "Link foto": photo_url
+            })
+            
+    return items_list, modifiers_list
+
+async def run_api_download_for_portal(user, pwd, start_date: str = None, end_date: str = None, browser=None):
+    is_valid, err_msg = validate_credentials(user, pwd)
+    if not is_valid:
+        logger.error(f"  ✗ [Validation] Invalid credentials for {user}: {err_msg}")
+        return None, f"Invalid credentials: {err_msg}"
+
+    session_dir = "sessions"
+    os.makedirs(session_dir, exist_ok=True)
+    session_path = os.path.join(session_dir, f"{user}.json")
+
+    p = None
+    managed_browser = None
+
+    for run_attempt in range(2):
+        context = None
+        page = None
+        try:
+            if browser is None and managed_browser is None:
+                p_inst = await async_playwright().start()
+                headless_env = True
+                try:
+                    from pathlib import Path
+                    import json as _json
+                    for parent in Path(__file__).resolve().parents:
+                        config_file = parent / "config.json"
+                        if config_file.exists():
+                            with open(config_file, "r") as f:
+                                headless_env = _json.load(f).get("headless_grab", True)
+                            break
+                except Exception:
+                    pass
+                managed_browser = await p_inst.chromium.launch(headless=headless_env)
+                browser = managed_browser
+                p = p_inst
+
+            storage_state = session_path if os.path.exists(session_path) and run_attempt == 0 else None
+            context = await browser.new_context(
+                storage_state=storage_state,
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+
+            # Step 1: Buka dashboard (cek sesi)
+            logger.info(f"  [Nav] Checking session via dashboard for {user}...")
+            try:
+                await page.goto("https://merchant.grab.com/dashboard", wait_until="domcontentloaded", timeout=30000)
+            except:
+                pass
+
+            api = GrabAPI(page, user, pwd)
+            mgid = await api.get_merchant_group_id()
+
+            if not mgid:
+                logger.info(f"  [Session] Not active. Logging in...")
+                if await perform_login(page, user, pwd):
+                    mgid = await api.get_merchant_group_id()
+                    if mgid:
+                        _lock = FileLock(f"{session_path}.lock", timeout=30)
+                        with _lock:
+                            await context.storage_state(path=session_path)
+                        logger.info(f"  [Session] Login success, session saved.")
+                    else:
+                        logger.error(f"  ✗ [Session] Login success but failed to get MGID.")
+                else:
+                    logger.error(f"  ✗ [Session] Login failed.")
+
+            if not mgid:
+                await context.close()
+                continue
+
+            # Step 2: Navigasi ke /food/menu + intercept request halaman untuk
+            # mendapatkan merchantId yang BENAR (sama dengan curl yang digunakan manual).
+            # Ini lebih andal daripada merchant-selector karena halaman tahu ID-nya sendiri.
+            logger.info(f"  [Nav] Opening /food/menu and intercepting merchant IDs...")
+            intercepted = await api.get_merchant_ids_from_page_requests()
+
+            if intercepted:
+                logger.info(f"  [Intercept] {len(intercepted)} store(s) found via page request interception.")
+                # Ambil nama dari merchant-selector sebagai metadata tambahan
+                selector_stores = await api.get_all_merchants_and_stores()
+                name_map = {s["store_id"]: s["store_name"] for s in selector_stores if s["store_id"]}
+                stores = []
+                for item in intercepted:
+                    sid = item["store_id"]
+                    stores.append({
+                        "group_id":   item["group_id"] or mgid,
+                        "group_name": "",
+                        "store_id":   sid,
+                        "store_name": name_map.get(sid) or sid,
+                    })
+            else:
+                logger.warning(f"  [Intercept] No requests intercepted. Falling back to merchant-selector.")
+                stores = await api.get_all_merchants_and_stores()
+                if not stores:
+                    logger.warning(f"  No stores found via merchant-selector. Using group_id as fallback.")
+                    stores = [{
+                        "group_id":   mgid,
+                        "group_name": "Default Group",
+                        "store_id":   mgid,
+                        "store_name": "Default Store",
+                    }]
+                # Navigasi ke food/menu karena interception belum dilakukan
+                try:
+                    await page.goto(
+                        "https://merchant.grab.com/food/menu",
+                        wait_until="domcontentloaded",
+                        timeout=30000
+                    )
+                    await page.wait_for_timeout(2000)
+                except Exception as nav_err:
+                    logger.warning(f"  [Nav] food/menu navigation failed: {nav_err}.")
+
+            all_items = []
+            all_modifiers = []
+
+            for s in stores:
+                store_id   = s["store_id"]
+                group_id   = s["group_id"]
+                store_name = s["store_name"]
+
+                # Jika multi-store, navigasi ke food/menu tiap store
+                if len(stores) > 1:
+                    try:
+                        await page.goto(
+                            "https://merchant.grab.com/food/menu",
+                            wait_until="domcontentloaded",
+                            timeout=30000
+                        )
+                        await page.wait_for_timeout(2000)
+                    except Exception as nav_err:
+                        logger.warning(f"  [Nav] food/menu re-navigation failed: {nav_err}.")
+
+                # Step 3: Fetch menu dari konteks halaman /food/menu
+                logger.info(f"  [Fetch] Fetching menu API for {store_name} ({store_id})...")
+                menu_data, err = await api.fetch_menu(group_id, store_id)
+                if menu_data:
+                    items, modifiers = parse_menu(menu_data, store_id, store_name, "")
+                    all_items.extend(items)
+                    all_modifiers.extend(modifiers)
+                    logger.info(f"  ✓ {store_name}: {len(items)} items, {len(modifiers)} modifiers")
+                else:
+                    logger.error(f"  ✗ Failed to fetch menu for {store_name}: {err}")
+
+            job_id   = uuid.uuid4().hex[:8]
+            filename = f"downloads/grab_menu_{user}_{job_id}.json"
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump({"items": all_items, "modifiers": all_modifiers}, f, ensure_ascii=False, indent=2)
+
+            await context.close()
+            if managed_browser:
+                await managed_browser.close()
+            if p:
+                await p.stop()
+            return (filename, None)
+
+        except Exception as e:
+            logger.error(f"Error in run_attempt {run_attempt}: {e}")
+            if context:
+                await context.close()
+            if run_attempt >= 1:
+                if managed_browser:
+                    await managed_browser.close()
+                if p:
+                    await p.stop()
+                return None, str(e)
+
+    if managed_browser:
+        await managed_browser.close()
+    if p:
+        await p.stop()
+    return None, "Max retries reached"
+
+
+# ============================================================
+# COOKIE-BASED DIRECT HTTP MODE (no Playwright needed)
+# Alur: cookie dari browser → merchant-selector → /food/menu
+#       → fetch menu API → parse → simpan JSON
+# ============================================================
+
+def get_merchants_via_cookie(cookie_str: str):
+    """Ambil semua merchant yang dapat diakses via cookie menggunakan requests."""
+    import requests as _req
+    url = "https://merchant.grab.com/troy/user-profile/v1/merchant-selector"
+    headers = {
+        "Accept": "application/json",
+        "Accept-Language": "en",
+        "Cookie": cookie_str,
+        "Origin": "https://merchant.grab.com",
+        "Referer": "https://merchant.grab.com/food/menu",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "requestsource": "troyPortal",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    try:
+        resp = _req.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            merchants = data.get("merchants", [])
+            results = []
+            for m in merchants:
+                group_id = m.get("id")
+                group_name = m.get("name")
+                stores = m.get("stores") or m.get("branches") or m.get("outlets")
+                if stores and isinstance(stores, list):
+                    for s in stores:
+                        results.append({
+                            "group_id": group_id,
+                            "group_name": group_name,
+                            "store_id": s.get("id"),
+                            "store_name": s.get("name"),
+                        })
+                else:
+                    results.append({
+                        "group_id": group_id,
+                        "group_name": group_name,
+                        "store_id": group_id,
+                        "store_name": group_name,
+                    })
+            return results, None
+        else:
+            return [], f"merchant-selector returned status {resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_menu_via_cookie(cookie_str: str, group_id: str, store_id: str):
+    """
+    Fetch menu untuk satu store via cookie menggunakan requests.
+    Referer disetel ke /food/menu sesuai alur manual browser.
+    """
+    import requests as _req
+    url = "https://api.grab.com/food/merchant/v2/menu"
+    headers = {
+        "Accept": "application/json",
+        "Accept-Language": "en",
+        "Cookie": cookie_str,
+        "merchantgroupid": group_id,
+        "merchantid": store_id,
+        "Origin": "https://merchant.grab.com",
+        "Referer": "https://merchant.grab.com/food/menu",
+        "requestsource": "troyPortal",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+    }
+    for attempt in range(3):
+        try:
+            resp = _req.get(url, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                return resp.json(), None
+            err = f"Status {resp.status_code}: {resp.text[:300]}"
+            logger.warning(f"  [Cookie] Attempt {attempt+1} fetch_menu failed: {err}")
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"  [Cookie] Attempt {attempt+1} fetch_menu exception: {e}")
+            time.sleep(2)
+    return None, "fetch_menu_via_cookie failed after 3 attempts"
+
+
+def run_cookie_download(cookie_str: str):
+    """
+    Download semua menu yang dapat diakses via cookie.
+    Tidak membutuhkan Playwright/browser sama sekali.
+    Meniru alur manual: merchant-selector → /food/menu → fetch API.
+    """
+    logger.info("[Cookie Mode] Fetching merchant list via cookie...")
+    merchants, err = get_merchants_via_cookie(cookie_str)
+    if err:
+        logger.error(f"[Cookie Mode] Gagal mengambil merchant list: {err}")
+        return None, err
+    if not merchants:
+        return None, "[Cookie Mode] Tidak ada merchant ditemukan. Cookie mungkin sudah kadaluarsa."
+
+    logger.info(f"[Cookie Mode] Ditemukan {len(merchants)} store.")
+
+    all_items = []
+    all_modifiers = []
+
+    for s in merchants:
+        store_id   = s["store_id"]
+        group_id   = s["group_id"]
+        store_name = s.get("store_name") or s.get("group_name") or store_id
+
+        logger.info(f"  [Cookie Mode] Fetching menu: {store_name} ({store_id})...")
+        menu_data, err = fetch_menu_via_cookie(cookie_str, group_id, store_id)
+        if menu_data:
+            items, modifiers = parse_menu(menu_data, store_id, store_name, "")
+            all_items.extend(items)
+            all_modifiers.extend(modifiers)
+            logger.info(f"  ✓ {store_name}: {len(items)} items, {len(modifiers)} modifiers")
+        else:
+            logger.error(f"  ✗ Gagal fetch menu {store_name}: {err}")
+
+    job_id   = uuid.uuid4().hex[:8]
+    filename = f"downloads/grab_menu_cookie_{job_id}.json"
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump({"items": all_items, "modifiers": all_modifiers}, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"[Cookie Mode] Saved {len(all_items)} items, {len(all_modifiers)} modifiers -> {filename}")
+    return filename, None
+
+
+if __name__ == "__main__":
+    async def main():
+        load_dotenv()
+        u, p = os.getenv("GRAB_USERNAME_PORTAL1"), os.getenv("GRAB_PASSWORD_PORTAL1")
+        if u and p:
+            res, err = await run_api_download_for_portal(u, p)
+            print(f"Result: {res or err}")
+    asyncio.run(main())
