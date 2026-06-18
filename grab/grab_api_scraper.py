@@ -242,7 +242,63 @@ class GrabAPI:
                     except Exception as e:
                         logger.warning(f"  [Selector] Failed to evaluate menu-groups: {e}")
                 
-                if not results and group_id and not str(group_id).startswith("IDMG"):
+                # Fallback ketiga: catalog-stores API (untuk akun seperti Roti Bakar 41)
+                if not results and group_id:
+                    logger.info(f"  [Selector] Mencoba catalog-stores API untuk {group_id}...")
+                    catalog_url = "https://portal.grab.com/foodtroy/v1/ID/merchant-groups/catalog-stores?offset=0&limit=100&isWithItemPhotoCount=true"
+                    js_catalog = f"""
+                    async () => {{
+                        try {{
+                            const response = await fetch("{catalog_url}", {{
+                                method: "GET",
+                                headers: {{
+                                    "Accept": "application/json",
+                                    "Accept-Language": "en",
+                                    "merchantgroupid": "{group_id}",
+                                    "requestsource": "troyPortal"
+                                }},
+                                credentials: "include"
+                            }});
+                            const status = response.status;
+                            const text = await response.text();
+                            try {{
+                                return {{ status, data: JSON.parse(text) }};
+                            }} catch (e) {{
+                                return {{ status, data: text }};
+                            }}
+                        }} catch (e) {{
+                            return {{ status: 0, error: e.toString() }};
+                        }}
+                    }}
+                    """
+                    try:
+                        cat_resp = await self.page.evaluate(js_catalog)
+                        if cat_resp and cat_resp.get("status") == 200:
+                            cat_data = cat_resp.get("data", {})
+                            # Coba berbagai field name yang mungkin digunakan oleh API
+                            cat_stores = (cat_data.get("stores") or cat_data.get("catalogStores") or
+                                         cat_data.get("merchants") or cat_data.get("items") or [])
+                            logger.info(f"  [Selector] Ditemukan {len(cat_stores)} catalog store(s) dari catalog-stores API untuk {group_id}")
+                            for cs in cat_stores:
+                                cs_id = (cs.get("merchantID") or cs.get("id") or cs.get("storeId") or
+                                        cs.get("merchantId") or cs.get("store_id"))
+                                cs_name = (cs.get("name") or cs.get("merchantName") or cs.get("storeName") or
+                                          cs.get("displayName") or group_name)
+                                if cs_id:
+                                    results.append({
+                                        "group_id": group_id,
+                                        "group_name": group_name,
+                                        "store_id": cs_id,
+                                        "store_name": cs_name,
+                                        "is_catalog": True
+                                    })
+                        else:
+                            logger.warning(f"  [Selector] catalog-stores API returned status {cat_resp.get('status') if cat_resp else 'None'}")
+                    except Exception as e:
+                        logger.warning(f"  [Selector] Failed to evaluate catalog-stores: {e}")
+
+                # Final fallback jika semua API gagal
+                if not results and group_id:
                     results.append({
                         "group_id": group_id,
                         "group_name": group_name,
@@ -1097,6 +1153,39 @@ def get_merchants_via_cookie(cookie_str: str):
                         except Exception as e:
                             logger.warning(f"  [Cookie Mode Selector] menu-groups fetch exception: {e}")
                     
+                    # Fallback ketiga: catalog-stores API (untuk akun seperti Roti Bakar 41)
+                    if not results and group_id:
+                        logger.info(f"  [Cookie Mode Selector] Mencoba catalog-stores API untuk {group_id}...")
+                        cat_url = "https://portal.grab.com/foodtroy/v1/ID/merchant-groups/catalog-stores?offset=0&limit=100&isWithItemPhotoCount=true"
+                        cat_headers = dict(headers)
+                        cat_headers["merchantgroupid"] = group_id
+                        try:
+                            cat_resp = _req.get(cat_url, headers=cat_headers, timeout=30)
+                            if cat_resp.status_code == 200:
+                                cat_data = cat_resp.json()
+                                # Coba berbagai field name yang mungkin digunakan oleh API
+                                cat_stores = (cat_data.get("stores") or cat_data.get("catalogStores") or
+                                             cat_data.get("merchants") or cat_data.get("items") or [])
+                                logger.info(f"  [Cookie Mode Selector] Ditemukan {len(cat_stores)} catalog store(s) dari API")
+                                for cs in cat_stores:
+                                    cs_id = (cs.get("merchantID") or cs.get("id") or cs.get("storeId") or
+                                            cs.get("merchantId") or cs.get("store_id"))
+                                    cs_name = (cs.get("name") or cs.get("merchantName") or cs.get("storeName") or
+                                              cs.get("displayName") or group_name)
+                                    if cs_id:
+                                        results.append({
+                                            "group_id": group_id,
+                                            "group_name": group_name,
+                                            "store_id": cs_id,
+                                            "store_name": cs_name,
+                                            "is_catalog": True
+                                        })
+                            else:
+                                logger.warning(f"  [Cookie Mode Selector] catalog-stores API returned status {cat_resp.status_code}: {cat_resp.text[:200]}")
+                        except Exception as e:
+                            logger.warning(f"  [Cookie Mode Selector] catalog-stores fetch exception: {e}")
+
+                    # Final fallback jika semua API gagal
                     if not results:
                         results.append({
                             "group_id": group_id,

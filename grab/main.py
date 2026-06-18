@@ -68,6 +68,29 @@ log = setup_logger()
 
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ3tLKBNXDqRgBw0mNhKZFxgvKx-JoiTDzm_s5Ix1cm7O6HCv4IvExOLR2HSRVaXSsx82V348mcr9X4/pub?gid=0&single=true&output=csv"
 
+# ----------------------------------------------------------------
+# Helper: Pencocokan portal berdasarkan Store ID atau nama
+# ----------------------------------------------------------------
+def clean_name_str(name):
+    """Hapus semua karakter non-alphanumeric dan ubah ke lowercase untuk perbandingan."""
+    return "".join(c for c in str(name).lower() if c.isalnum())
+
+def matches_portal(item, portal):
+    """
+    Cek apakah item/modifier JSON cocok dengan portal dari spreadsheet.
+    Prioritas 1: cocokkan Store ID (untuk akun menu-group / catalog-stores).
+    Prioritas 2: fallback ke clean name matching.
+    """
+    item_sid = str(item.get("Store ID", "")).strip()
+    portal_sid = str(portal.get("store_id", "")).strip()
+    if item_sid and portal_sid and item_sid.lower() == portal_sid.lower():
+        return True
+    t_clean = clean_name_str(portal.get("outlet", ""))
+    item_clean = clean_name_str(item.get("Nama panjang", ""))
+    if not t_clean or not item_clean:
+        return False
+    return t_clean in item_clean or item_clean in t_clean
+
 def check_and_upload_gdrive(master_item_xlsx, master_mod_xlsx, portals):
     """
     Fungsi penunjang untuk otomatis mengunggah file hasil laporan (.xlsx) yang relevan
@@ -254,8 +277,8 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                     r["Store ID"] = portal["store_id"]
                 return r
 
-            matched_items = [_patch(x) for x in items_all if t_clean in _clean(x.get("Nama panjang", "")) or _clean(x.get("Nama panjang", "")) in t_clean]
-            matched_mods  = [_patch(x) for x in mods_all  if t_clean in _clean(x.get("Nama panjang", "")) or _clean(x.get("Nama panjang", "")) in t_clean]
+            matched_items = [_patch(x) for x in items_all if matches_portal(x, portal)]
+            matched_mods  = [_patch(x) for x in mods_all  if matches_portal(x, portal)]
 
             # Fallback jika 1 portal dan tidak ada match nama
             if not matched_items and len(portals) == 1:
@@ -448,8 +471,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                         target_clean = clean_name(portal['outlet'])
                         
                         for item in items:
-                            item_clean = clean_name(item["Nama panjang"])
-                            if target_clean in item_clean or item_clean in target_clean:
+                            if matches_portal(item, portal):
                                 item_copy = dict(item)
                                 item_copy["Nama panjang"] = portal["outlet"]
                                 if portal["store_id"]:
@@ -457,8 +479,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                                 matched_items.append(item_copy)
                                 
                         for mod in modifiers:
-                            mod_clean = clean_name(mod["Nama panjang"])
-                            if target_clean in mod_clean or mod_clean in target_clean:
+                            if matches_portal(mod, portal):
                                 mod_copy = dict(mod)
                                 mod_copy["Nama panjang"] = portal["outlet"]
                                 if portal["store_id"]:

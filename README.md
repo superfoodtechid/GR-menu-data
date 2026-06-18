@@ -1,39 +1,38 @@
-# 🚀 Agency Report — Unified Weekly Transaction Pipeline
+# 🍽️ Grab Menu Data — Scraper & Laporan Menu GrabFood
 
-Pipeline otomatis untuk mengunduh dan mengolah laporan transaksi mingguan dari platform **GrabFood** dan **ShopeeFood**, dijalankan melalui satu CLI terpadu.
+Pipeline otomatis untuk mengunduh dan mengolah **data menu** (item & modifier) dari portal **GrabFood Merchant**, dijalankan melalui satu CLI terpadu dengan dukungan tiga tipe struktur akun.
+
+---
+
+## 🆕 Pembaruan Terbaru (Juni 2026)
+
+- **Dukungan 3 Tipe Portal Grab**: Selain akun normal, kini mendukung akun bertipe **Menu Groups** (contoh: AGSA – Ayam Geprek Suroboyo) dan **Catalog Stores** (contoh: Roti Bakar 41) yang memiliki banyak merchant ID dalam satu portal.
+- **Auto-Deteksi Tipe Akun**: Scraper secara otomatis mendeteksi tipe akun melalui fallback chain: `merchant-selector` → `menu-groups API` → `catalog-stores API`.
+- **Store ID Matching**: Pencocokan item & modifier menu kini memprioritaskan `Store ID` (bukan hanya nama), sehingga file Excel untuk cabang multi-outlet tidak lagi kosong.
+- **Upload Otomatis ke Google Drive**: File laporan Excel dikirim otomatis ke Google Drive via Google Apps Script setelah proses selesai.
+- **Bersihkan Data Lokal**: Menu baru di CLI untuk menghapus semua file laporan lokal sekaligus.
 
 ---
 
-## 🆕 Recent Updates (Juni 2026)
-- **Parallel Polling (Shopee Batching)**: Phase 2 (menunggu dan mengunduh laporan) sekarang berjalan secara paralel menggunakan `ThreadPoolExecutor`. Total waktu eksekusi Phase 2 untuk puluhan merchant turun drastis dari ~7 menit menjadi ~1-2 menit.
-- **Robust Merchant Switching**:
-  - Penanganan _Hover-submenu_ (Ant Design) pada "Pilih Merchant Lain" yang lebih stabil menggunakan `ActionChains`.
-  - Normalisasi nama merchant otomatis (mengabaikan spasi dan *trailing underscore* seperti `Merchant_`).
-  - *Auto-scroll* untuk menemukan merchant yang berada di luar layar pada *dropdown* panjang.
-- **Gitignore Optimizations**: Menambahkan rule untuk mengabaikan direktori _bloat/cache_ pada profil Chrome (seperti `Cache/`, `Code Cache/`, `Crashpad/`) namun tetap mempertahankan *session login* (`Default` profile) agar mudah dipindahkan antar perangkat tanpa login ulang (OTP).
-
----
 ## 📁 Struktur Proyek
 
 ```
-agency/
-├── cli.py                  # Entry point utama (unified CLI)
-├── config.json             # Konfigurasi global (headless, concurrency)
-├── pyproject.toml          # Definisi dependensi (dikelola uv)
-├── start.sh                # Script setup & run (Linux/macOS)
-├── start.bat               # Script setup & run (Windows)
+Grab Menu Data/
+├── cli.py                    # Entry point utama (wizard interaktif)
+├── config.json               # Konfigurasi global (headless, concurrency)
+├── pyproject.toml            # Definisi dependensi (dikelola uv)
+├── start.bat                 # Script setup & run (Windows)
+├── start.sh                  # Script setup & run (Linux/macOS)
+├── .env                      # Konfigurasi Google Drive (tidak di-commit)
+├── google_apps_script.gs     # Apps Script untuk upload ke Google Drive
+├── upload_to_gdrive.py       # Modul upload file via Google Apps Script
 ├── grab/
-│   ├── grab_api_scraper.py # Logika scraping API Grab (Playwright)
-│   ├── main.py             # Pipeline multi-portal Grab
-│   └── result.py           # Kalkulasi & format hasil Grab
-├── shopee/
-│   ├── run_weekly.py       # Pipeline multi-merchant Shopee
-│   └── merge_analyzed.py   # Utilitas merge laporan Shopee
-└── core/
-    ├── browser.py          # Manajemen sesi browser (Selenium/undetected-chromedriver)
-    ├── client.py           # ShopeeClient HTTP (API calls)
-    ├── logger.py           # Logger terpusat
-    └── otp.py              # Penanganan OTP Shopee
+│   ├── grab_api_scraper.py   # Logika scraping API Grab (Playwright + Cookie)
+│   ├── main.py               # Pipeline multi-portal Grab Menu
+│   └── result.py             # Kalkulasi & format hasil
+├── laporan/
+│   └── menu/                 # Output file Excel menu per outlet
+└── scratch/                  # Script debug & diagnostik (tidak di-commit)
 ```
 
 ---
@@ -50,24 +49,19 @@ agency/
 
 ## 🔧 Instalasi
 
-### Linux / macOS
-
-```bash
-# Clone repositori
-git clone https://github.com/superfoodtechid/agency-scrapper.git
-cd agency-scrapper
-
-# Setup otomatis (install uv, sync dependensi, install Playwright Chromium)
-bash start.sh
-```
-
 ### Windows
 
 ```bat
 start.bat
 ```
 
-### Manual (tanpa start.sh)
+### Linux / macOS
+
+```bash
+bash start.sh
+```
+
+### Manual
 
 ```bash
 # Install uv jika belum ada
@@ -76,7 +70,7 @@ pip install uv
 # Sync dependensi virtual environment
 uv sync
 
-# Install browser Chromium untuk Playwright (digunakan Grab)
+# Install browser Chromium untuk Playwright
 uv run python -m playwright install chromium
 
 # Jalankan CLI
@@ -91,29 +85,31 @@ uv run python cli.py
 
 ```json
 {
-  "headless_grab": false,
-  "headless_shopee": false,
-  "max_concurrency": 3
+  "headless_grab": true,
+  "max_concurrency": 3,
+  "batch_size": 5,
+  "batch_delay": 5
 }
 ```
 
 | Key | Tipe | Default | Keterangan |
 |---|---|---|---|
-| `headless_grab` | bool | `false` | Jalankan browser Grab tanpa GUI |
-| `headless_shopee` | bool | `false` | Jalankan browser Shopee tanpa GUI |
-| `max_concurrency` | int | `3` | Jumlah akun Grab yang diproses secara paralel |
+| `headless_grab` | bool | `true` | Jalankan browser Grab tanpa GUI |
+| `max_concurrency` | int | `3` | Jumlah akun yang diproses paralel |
+| `batch_size` | int | `5` | Jumlah akun per batch |
+| `batch_delay` | int | `5` | Jeda antar batch (detik) |
 
-### `.env` (opsional)
-
-File `.env` di root proyek dapat digunakan untuk menyimpan kredensial Shopee:
+### `.env` — Konfigurasi Google Drive (opsional)
 
 ```env
-SHOPEE_USERNAME=username_anda
-SHOPEE_PASSWORD=password_anda
-SHOPEE_PHONE=08xxxxxxxxxx
+# URL Web App Google Apps Script (deploy sebagai "Anyone can access")
+GDRIVE_APPSCRIPT_URL=https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec
+
+# ID folder Google Drive tujuan upload
+GDRIVE_FOLDER_ID=your_folder_id_here
 ```
 
-> **Catatan:** Jika tidak ada `.env`, pipeline Shopee akan otomatis mengambil kredensial dari Google Sheets master.
+> Jika `GDRIVE_APPSCRIPT_URL` tidak diisi, proses upload akan dilewati secara otomatis.
 
 ---
 
@@ -121,174 +117,203 @@ SHOPEE_PHONE=08xxxxxxxxxx
 
 ### Mode Interaktif (Direkomendasikan)
 
-Jalankan tanpa argumen untuk masuk ke wizard interaktif:
-
 ```bash
 uv run python cli.py
 ```
 
-Wizard akan memandu Anda memilih:
-1. **Platform** — Grab, Shopee, atau keduanya
-2. **Cakupan Outlet** — semua outlet atau filter spesifik
-3. **Rentang Tanggal** — minggu lalu (otomatis) atau input manual
+Wizard akan menampilkan menu:
+
+```
+=================================================================
+★                     GET OUTLET DATA GRAB                    ★
+=================================================================
+
+  Pilih cakupan outlet:
+    [1] Pilih semua outlet
+    [2] Pilih custom (Filter spesifik)
+    [3] Bersihkan data laporan lokal
+    [4] Keluar
+```
 
 ### Mode CLI (Non-Interaktif)
 
 ```bash
-# Semua outlet, semua platform, minggu ini
-uv run python cli.py all --start 2026-06-02 --end 2026-06-08
+# Semua outlet
+uv run python grab/main.py
 
-# Hanya Grab, outlet tertentu
-uv run python cli.py grab --start 2026-06-02 --end 2026-06-08 --outlet "Nama Outlet" --branch "Nama Cabang"
+# Filter outlet tertentu
+uv run python grab/main.py --outlet "Nama Outlet"
 
-# Hanya Shopee, merchant tertentu
-uv run python cli.py shopee --start 2026-06-02 --end 2026-06-08
+# Filter outlet + cabang
+uv run python grab/main.py --outlet "Nama Outlet" --branch "Nama Cabang"
 
-# Filter berdasarkan username akun Grab
-uv run python cli.py grab --start 2026-06-02 --end 2026-06-08 --user "username@email.com"
+# Filter berdasarkan username akun
+uv run python grab/main.py --user "username@email.com"
+
+# Override direktori output
+uv run python grab/main.py --output-dir "path/ke/direktori"
 ```
-
-### Argumen CLI
-
-| Argumen | Keterangan |
-|---|---|
-| `platform` | `grab`, `shopee`, atau `all` |
-| `--start` | Tanggal mulai (format: `YYYY-MM-DD` atau `DD-MM-YYYY`) |
-| `--end` | Tanggal akhir (format: `YYYY-MM-DD` atau `DD-MM-YYYY`) |
-| `--outlet` | Filter nama outlet (Grab) |
-| `--branch` | Filter nama cabang (Grab) |
-| `--user` | Filter username akun spesifik (Grab) |
 
 ---
 
-## 📊 Output Laporan
+## 🏗️ Tipe Struktur Akun yang Didukung
 
-Semua laporan disimpan di direktori `laporan/` (dikecualikan dari Git):
+Scraper mendukung **3 tipe struktur akun** GrabFood Merchant secara otomatis:
+
+| # | Tipe | Contoh | Cara Deteksi | Endpoint Menu |
+|---|---|---|---|---|
+| 1 | **Normal** | Holans, dll | `merchant-selector` langsung punya `stores[]` | `/food/merchant/v2/menu` |
+| 2 | **Menu Groups** | AGSA – Geprek/Cinara/Hauchek | Group ID `IDMG*` tanpa stores → `menu-groups` API | `/food/merchant/v2/menu-groups/menu?menuGroupID=...` |
+| 3 | **Catalog Stores** | Roti Bakar 41 | Tidak ada stores → `catalog-stores` API | `/food/merchant/v2/menu` dengan `merchantid` |
+
+### Fallback Chain Otomatis
 
 ```
-laporan/
-├── grab/
-│   └── 2026-06-02_to_2026-06-08/
-│       ├── NamaOutlet_Cabang.xlsx    # Per portal
-│       └── 0Master.xlsx              # Gabungan semua portal
-└── shopee/
-    └── 2026-06-02_to_2026-06-08/
-        ├── MerchantName_Transactions_*.xlsx   # Per merchant (raw + analyzed)
-        └── 0Master.xlsx                       # Gabungan semua merchant
+merchant-selector stores[]
+       ↓ (kosong)
+menu-groups API  →  /food/merchant/v1/menu-groups
+       ↓ (kosong)
+catalog-stores API  →  /foodtroy/v1/ID/merchant-groups/catalog-stores
+       ↓ (kosong)
+group_id sebagai fallback terakhir
 ```
-
-### Format Kolom Master Grab
-
-`Flag`, `Month`, `Merchant Name`, `Merchant ID`, `Store Name`, `Transaction ID`, `Amount`, `Net Sales`, `Grab Fee`, `Total`, dll.
-
-### Format Kolom Master Shopee
-
-`Merchant Name`, `Store ID`, `Nama Toko`, `No. Pesanan`, `Waktu Penyelesaian`, `Nilai Transaksi`, `Harga Makanan`, `Diskon`, `Commission`, `Revenue`, `OFD Fees`, dll.
 
 ---
 
 ## 🔄 Alur Pipeline
 
-### Pipeline Grab
-
 ```
-[Google Sheets]  →  Ambil daftar outlet & kredensial
-      ↓
-[Playwright]     →  Login & unduh laporan CSV via API Grab (paralel, max 3)
-      ↓
-[Retry Logic]    →  Ulangi akun gagal secara sekuensial
-      ↓
-[Merge]          →  Gabungkan semua CSV → 0Master.xlsx
-      ↓
-[Output]         →  laporan/grab/<range>/
-```
-
-### Pipeline Shopee
-
-```
-[Google Sheets]  →  Ambil daftar merchant ShopeeFood Live
-      ↓
-Phase 1: [Selenium]  →  Login → switch merchant → trigger export
-      ↓
-Phase 2: [API Poll]  →  Polling status laporan → unduh .xlsx
-      ↓
-Phase 3: [Analyze]   →  Hitung Commission, Revenue, OFD Fees
-      ↓
-Phase 4: [Merge]     →  Gabungkan semua → 0Master.xlsx
-      ↓
-[Output]             →  laporan/shopee/<range>/
+[Google Sheets]       →  Ambil daftar outlet, Store ID & kredensial
+       ↓
+[Auto-Deteksi Tipe]   →  Normal / Menu Groups / Catalog Stores
+       ↓
+[Playwright / Cookie] →  Login & fetch menu via API Grab
+       ↓
+[Store ID Matching]   →  Cocokkan item & modifier ke portal yang tepat
+       ↓
+[Excel per Outlet]    →  laporan/menu/<outlet>_menu_item.xlsx
+                          laporan/menu/<outlet>_menu_modifier.xlsx
+       ↓
+[Master Merge]        →  laporan/menu/0Master_menu_item.xlsx
+                          laporan/menu/0Master_menu_modifier.xlsx
+       ↓
+[Google Drive Upload] →  Upload file relevan (master + outlet aktif)
 ```
 
 ---
 
-## 🛠️ Pengembangan
+## 📊 Output Laporan
 
-### Toggle Konfigurasi Kode
+Semua laporan disimpan di `laporan/menu/`:
 
-Di `grab/main.py` dan `shopee/run_weekly.py`, terdapat toggle global:
-
-```python
-ENABLE_GSHEETS_PUSH = False   # Set True untuk push ke Google Sheets
-ENABLE_POSTGRES_PUSH = False  # Set True untuk sinkronisasi ke PostgreSQL
+```
+laporan/menu/
+├── 0Master_menu_item.xlsx         # Gabungan semua item dari semua outlet
+├── 0Master_menu_modifier.xlsx     # Gabungan semua modifier dari semua outlet
+├── NamaOutlet_menu_item.xlsx      # Data item per outlet
+├── NamaOutlet_Cabang_menu_item.xlsx
+└── ...
 ```
 
-### Menjalankan Modul Secara Terpisah
+### Kolom File Item (`*_menu_item.xlsx`)
 
-```bash
-# Pipeline Grab saja
-cd grab
-uv run python main.py --start-date 2026-06-02 --end-date 2026-06-08
+| Kolom | Keterangan |
+|---|---|
+| `Link outlet` | URL GrabFood outlet |
+| `Nama panjang` | Nama outlet (dari spreadsheet) |
+| `Store ID` | ID merchant Grab |
+| `Nama kategori` | Kategori menu |
+| `Nama item` | Nama item menu |
+| `Jumlah terjual` | Kuantitas terjual |
+| `Jumlah modifier group` | Jumlah grup modifier pada item |
+| `Jumlah modifier` | Total modifier pada item |
+| `Deskripsi item` | Deskripsi menu |
+| `Harga item sebelum promo` | Harga normal |
+| `Harga item setelah promo` | Harga setelah diskon |
+| `Nominal atau persentase promo` | Selisih harga promo |
+| `Ketersediaan item` | `Available` / `Sold Out` |
+| `Link foto` | URL foto menu |
 
-# Pipeline Shopee saja
-cd shopee
-uv run python run_weekly.py --start 2026-06-02 --end 2026-06-08 --merchant "Nama Merchant"
+### Kolom File Modifier (`*_menu_modifier.xlsx`)
 
-# Skip fase download, hanya merge file yang sudah ada
-cd shopee
-uv run python run_weekly.py --skip-download
-```
+| Kolom | Keterangan |
+|---|---|
+| `Link outlet` | URL GrabFood outlet |
+| `Nama panjang` | Nama outlet |
+| `Store ID` | ID merchant Grab |
+| `Nama item` | Nama item induk |
+| `Nama modifier group` | Nama grup modifier |
+| `Nama modifier` | Nama opsi modifier |
+| `Tipe modifier` | `SINGLE` / `MULTIPLE` |
+| `Minimal` | Minimum pilihan |
+| `Maksimal` | Maksimum pilihan |
+| `Harga modifier` | Harga tambahan modifier |
+| `Ketersediaan modifier` | `Available` / `Sold Out` |
+
+---
+
+## ☁️ Upload ke Google Drive
+
+### Setup Google Apps Script
+
+1. Buka [script.google.com](https://script.google.com) → buat project baru
+2. Salin isi file `google_apps_script.gs` ke editor Apps Script
+3. Klik **Deploy** → **New Deployment** → pilih tipe **Web App**
+4. Atur akses: **Anyone** (tanpa autentikasi)
+5. Salin URL deployment → isi ke `.env` sebagai `GDRIVE_APPSCRIPT_URL`
+6. Buat folder di Google Drive → salin ID-nya → isi ke `.env` sebagai `GDRIVE_FOLDER_ID`
+
+### Perilaku Upload
+
+- Hanya file yang relevan dengan sesi yang diunggah (master + outlet aktif)
+- File lama di folder Drive akan di-**overwrite** jika ada nama yang sama
+- Jika upload gagal dengan HTTP 401/403, periksa pengaturan akses Web App
 
 ---
 
 ## 📋 Sumber Data Master
 
-Daftar merchant, outlet, cabang, dan kredensial diambil dari Google Sheets internal (akses terbatas). Pipeline secara otomatis mem-filter hanya entri dengan:
-- `Aplikasi` = `GrabFood` / `ShopeeFood`  
+Daftar outlet, cabang, Store ID, dan kredensial diambil dari **Google Sheets internal** (akses terbatas). Pipeline secara otomatis mem-filter hanya entri dengan:
+- `Aplikasi` mengandung `Grab`
 - `Status` = `Live`
 
-Cache lokal disimpan sementara di `shopee/data/master_merchants_cache.csv` untuk mengurangi beban request.
+> **Penting**: Kolom `Store ID` di Google Sheets harus diisi dengan `merchantID` dari Grab agar pencocokan data berjalan dengan benar untuk akun **Menu Groups** dan **Catalog Stores**.
 
 ---
 
 ## 🔐 File yang Diabaikan Git
 
-Berikut file/direktori yang **tidak** masuk ke repositori:
-
 | Path | Keterangan |
 |---|---|
-| `.env` | Kredensial environment |
-| `laporan/` | Output laporan |
+| `.env` | Konfigurasi Google Drive & kredensial |
+| `laporan/` | Output laporan Excel |
 | `logs/` | Log eksekusi |
-| `*.xlsx`, `*.csv` | File laporan mentah dan olahan |
-| `*credentials*.json` | File kredensial |
-| `shopee/data/*_cache.csv` | Cache merchant |
+| `*.xlsx`, `*.csv` | File laporan |
+| `grab/sessions/` | Session Playwright (login tersimpan) |
+| `grab/downloads/` | File JSON download sementara |
 | `.venv/` | Virtual environment |
 
 ---
 
 ## 🐛 Troubleshooting
 
+**File Excel kosong untuk cabang tertentu (AGSA, Roti Bakar 41, dll)**
+> Pastikan kolom `Store ID` di Google Sheets diisi dengan `merchantID` yang benar dari Grab API. Scraper kini memprioritaskan pencocokan by Store ID.
+
+**Upload gagal dengan HTTP 401**
+> Periksa pengaturan deploy Google Apps Script: akses harus diset ke **"Anyone"** (bukan "Only myself" atau "Anyone with Google Account").
+
 **Browser tidak muncul / crash**
-> Pastikan Google Chrome versi terbaru terinstal. Coba set `headless_grab: true` di `config.json`.
+> Set `"headless_grab": false` di `config.json` untuk mode visual, atau `true` untuk mode headless.
 
-**Error "uv not found"**
-> Jalankan `bash start.sh` — script akan otomatis menginstal `uv`.
+**Tidak ada merchant ditemukan (Cookie Mode)**
+> Cookie mungkin sudah kedaluwarsa. Hapus file session di `grab/sessions/` dan jalankan ulang agar login ulang.
 
-**Merchant tidak terdeteksi (Shopee)**
-> Pastikan nama merchant di Google Sheets persis sama (case-sensitive) dengan yang muncul di portal Shopee seller.
+**Error `max_concurrency` menyebabkan blokir**
+> Kurangi `max_concurrency` di `config.json` menjadi `1` atau `2` untuk koneksi lambat atau akun yang sering diblokir.
 
-**Gagal download laporan Grab (timeout)**
-> Kurangi `max_concurrency` di `config.json` menjadi `1` atau `2` untuk koneksi lambat.
+**Gagal fetch `catalog-stores` atau `menu-groups`**
+> Lihat log di `grab/logs/`. Jika muncul `MerchantGroupID validation failed`, token/cookie yang digunakan tidak sesuai dengan grup yang diminta.
 
 ---
 
