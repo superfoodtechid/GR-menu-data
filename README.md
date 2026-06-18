@@ -9,7 +9,8 @@ Pipeline otomatis untuk mengunduh dan mengolah **data menu** (item & modifier) d
 - **Dukungan 3 Tipe Portal Grab**: Selain akun normal, kini mendukung akun bertipe **Menu Groups** (contoh: AGSA – Ayam Geprek Suroboyo) dan **Catalog Stores** (contoh: Roti Bakar 41) yang memiliki banyak merchant ID dalam satu portal.
 - **Auto-Deteksi Tipe Akun**: Scraper secara otomatis mendeteksi tipe akun melalui fallback chain: `merchant-selector` → `menu-groups API` → `catalog-stores API`.
 - **Store ID Matching**: Pencocokan item & modifier menu kini memprioritaskan `Store ID` (bukan hanya nama), sehingga file Excel untuk cabang multi-outlet tidak lagi kosong.
-- **Upload Otomatis ke Google Drive**: File laporan Excel dikirim otomatis ke Google Drive via Google Apps Script setelah proses selesai.
+- **Struktur Subfolder per Outlet**: Hasil laporan disimpan dalam subfolder tersendiri per outlet di `laporan/menu/<NamaOutlet>/` — baik lokal maupun di Google Drive.
+- **Upload Otomatis ke Google Drive**: File laporan per outlet dikirim otomatis ke subfolder Google Drive yang sesuai via Google Apps Script. File master **tidak** diunggah ke Drive.
 - **Bersihkan Data Lokal**: Menu baru di CLI untuk menghapus semua file laporan lokal sekaligus.
 
 ---
@@ -31,7 +32,7 @@ Grab Menu Data/
 │   ├── main.py               # Pipeline multi-portal Grab Menu
 │   └── result.py             # Kalkulasi & format hasil
 ├── laporan/
-│   └── menu/                 # Output file Excel menu per outlet
+│   └── menu/                 # Output file Excel menu (subfolder per outlet)
 └── scratch/                  # Script debug & diagnostik (tidak di-commit)
 ```
 
@@ -105,7 +106,7 @@ uv run python cli.py
 # URL Web App Google Apps Script (deploy sebagai "Anyone can access")
 GDRIVE_APPSCRIPT_URL=https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec
 
-# ID folder Google Drive tujuan upload
+# ID folder Google Drive tujuan upload (folder induk)
 GDRIVE_FOLDER_ID=your_folder_id_here
 ```
 
@@ -191,29 +192,49 @@ group_id sebagai fallback terakhir
        ↓
 [Store ID Matching]   →  Cocokkan item & modifier ke portal yang tepat
        ↓
-[Excel per Outlet]    →  laporan/menu/<outlet>_menu_item.xlsx
-                          laporan/menu/<outlet>_menu_modifier.xlsx
+[Excel per Outlet]    →  laporan/menu/<NamaOutlet>/<NamaOutlet>_menu_item.xlsx
+                          laporan/menu/<NamaOutlet>/<NamaOutlet>_menu_modifier.xlsx
        ↓
-[Master Merge]        →  laporan/menu/0Master_menu_item.xlsx
-                          laporan/menu/0Master_menu_modifier.xlsx
+[Master Merge]        →  laporan/menu/0Master_menu_item.xlsx   (lokal saja)
+                          laporan/menu/0Master_menu_modifier.xlsx (lokal saja)
        ↓
-[Google Drive Upload] →  Upload file relevan (master + outlet aktif)
+[Google Drive Upload] →  Upload file per outlet ke subfolder masing-masing
+                          (file master TIDAK diunggah ke Drive)
 ```
 
 ---
 
 ## 📊 Output Laporan
 
-Semua laporan disimpan di `laporan/menu/`:
+### Struktur Lokal
 
 ```
 laporan/menu/
-├── 0Master_menu_item.xlsx         # Gabungan semua item dari semua outlet
-├── 0Master_menu_modifier.xlsx     # Gabungan semua modifier dari semua outlet
-├── NamaOutlet_menu_item.xlsx      # Data item per outlet
-├── NamaOutlet_Cabang_menu_item.xlsx
+├── 0Master_menu_item.xlsx          # Gabungan semua item (lokal saja, tidak ke Drive)
+├── 0Master_menu_modifier.xlsx      # Gabungan semua modifier (lokal saja, tidak ke Drive)
+├── NamaOutlet1/
+│   ├── NamaOutlet1_menu_item.xlsx
+│   └── NamaOutlet1_menu_modifier.xlsx
+├── NamaOutlet2_CabangA/
+│   ├── NamaOutlet2_CabangA_menu_item.xlsx
+│   └── NamaOutlet2_CabangA_menu_modifier.xlsx
 └── ...
 ```
+
+### Struktur Google Drive
+
+```
+[GDRIVE_FOLDER_ID]/                 ← folder induk
+├── NamaOutlet1/                    ← subfolder dibuat otomatis
+│   ├── NamaOutlet1_menu_item.xlsx
+│   └── NamaOutlet1_menu_modifier.xlsx
+├── NamaOutlet2_CabangA/
+│   ├── NamaOutlet2_CabangA_menu_item.xlsx
+│   └── NamaOutlet2_CabangA_menu_modifier.xlsx
+└── ...
+```
+
+> File master **tidak** diunggah ke Google Drive — hanya tersedia secara lokal.
 
 ### Kolom File Item (`*_menu_item.xlsx`)
 
@@ -259,15 +280,32 @@ laporan/menu/
 1. Buka [script.google.com](https://script.google.com) → buat project baru
 2. Salin isi file `google_apps_script.gs` ke editor Apps Script
 3. Klik **Deploy** → **New Deployment** → pilih tipe **Web App**
-4. Atur akses: **Anyone** (tanpa autentikasi)
+4. Atur: *Execute as* = **Me**, *Who has access* = **Anyone**
 5. Salin URL deployment → isi ke `.env` sebagai `GDRIVE_APPSCRIPT_URL`
-6. Buat folder di Google Drive → salin ID-nya → isi ke `.env` sebagai `GDRIVE_FOLDER_ID`
+6. Buat folder induk di Google Drive → salin ID-nya → isi ke `.env` sebagai `GDRIVE_FOLDER_ID`
+
+> ⚠️ Setiap kali `google_apps_script.gs` diubah, wajib buat **New Deployment** baru dan perbarui URL di `.env`.
 
 ### Perilaku Upload
 
-- Hanya file yang relevan dengan sesi yang diunggah (master + outlet aktif)
-- File lama di folder Drive akan di-**overwrite** jika ada nama yang sama
-- Jika upload gagal dengan HTTP 401/403, periksa pengaturan akses Web App
+- Hanya file **per-outlet** yang diunggah (file master tidak dikirim ke Drive)
+- Subfolder per outlet dibuat otomatis di Google Drive jika belum ada
+- File lama di subfolder Drive akan di-**overwrite** jika ada nama yang sama
+- Upload hanya mencakup outlet yang aktif pada sesi tersebut
+- Jika `GDRIVE_APPSCRIPT_URL` kosong, proses upload dilewati tanpa error
+
+### Upload Manual
+
+```bash
+# Upload semua file (master + subfolder outlet)
+uv run python upload_to_gdrive.py
+
+# Upload file tertentu saja
+uv run python upload_to_gdrive.py --files path/ke/file.xlsx
+
+# Override folder ID
+uv run python upload_to_gdrive.py --folder-id YOUR_FOLDER_ID
+```
 
 ---
 
@@ -302,6 +340,9 @@ Daftar outlet, cabang, Store ID, dan kredensial diambil dari **Google Sheets int
 
 **Upload gagal dengan HTTP 401**
 > Periksa pengaturan deploy Google Apps Script: akses harus diset ke **"Anyone"** (bukan "Only myself" atau "Anyone with Google Account").
+
+**Subfolder tidak terbuat di Google Drive**
+> Pastikan Apps Script sudah di-deploy ulang setelah perubahan terbaru pada `google_apps_script.gs`. URL `/exec` yang lama tidak akan mengenali parameter `subFolderName`.
 
 **Browser tidak muncul / crash**
 > Set `"headless_grab": false` di `config.json` untuk mode visual, atau `true` untuk mode headless.

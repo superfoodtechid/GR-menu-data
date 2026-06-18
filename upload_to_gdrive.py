@@ -17,9 +17,10 @@ YELLOW = "\033[93m"
 RED    = "\033[91m"
 MAGENTA = "\033[95m"
 
-def upload_file_to_gdrive(file_path: str, script_url: str, folder_id: str = None) -> bool:
+def upload_file_to_gdrive(file_path: str, script_url: str, folder_id: str = None, sub_folder_name: str = None) -> bool:
     """
     Mengirimkan file ke Google Apps Script Web App untuk disimpan di Google Drive.
+    Jika sub_folder_name diberikan, file akan disimpan di subfolder tersebut di dalam folder induk.
     """
     path = Path(file_path)
     if not path.is_file():
@@ -29,7 +30,8 @@ def upload_file_to_gdrive(file_path: str, script_url: str, folder_id: str = None
     file_name = path.name
     file_size_mb = path.stat().st_size / (1024 * 1024)
     
-    print(f"  {CYAN}📄 Memproses file: {BOLD}{file_name}{RESET} ({file_size_mb:.2f} MB)...")
+    location_label = f"{sub_folder_name}/{file_name}" if sub_folder_name else file_name
+    print(f"  {CYAN}📄 Memproses file: {BOLD}{location_label}{RESET} ({file_size_mb:.2f} MB)...")
     
     # Deteksi mime type
     mime_type, _ = mimetypes.guess_type(file_path)
@@ -61,6 +63,8 @@ def upload_file_to_gdrive(file_path: str, script_url: str, folder_id: str = None
         }
         if folder_id:
             payload["folderId"] = folder_id
+        if sub_folder_name:
+            payload["subFolderName"] = sub_folder_name
 
         headers = {
             "Content-Type": "application/json"
@@ -78,6 +82,9 @@ def upload_file_to_gdrive(file_path: str, script_url: str, folder_id: str = None
                 res_json = response.json()
                 if res_json.get("status") == "success":
                     print(f"  {GREEN}✓ Berhasil diunggah ke Google Drive!{RESET}")
+                    if res_json.get("subFolder"):
+                        created_label = " (folder baru dibuat)" if res_json.get("subFolderCreated") else " (folder sudah ada)"
+                        print(f"    📂 Subfolder : {res_json.get('subFolder')}{created_label}")
                     print(f"    📂 ID Folder : {res_json.get('folderId')}")
                     print(f"    🆔 ID File   : {res_json.get('fileId')}")
                     print(f"    🔗 Link File : {CYAN}{res_json.get('url')}{RESET}")
@@ -132,18 +139,26 @@ def main():
         sys.exit(1)
 
     # Menentukan file yang akan diunggah
-    files_to_upload = []
+    # Format: list of (file_path, sub_folder_name_or_None)
+    files_to_upload = []  # list of (path_str, subfolder_str|None)
     if args.files:
         for f in args.files:
-            files_to_upload.append(f)
+            files_to_upload.append((f, None))
     else:
-        # Default: unggah semua file .xlsx di laporan/menu jika tidak ditentukan
+        # Default: unggah file master (root) + file outlet (subfolder) dari laporan/menu
         laporan_menu_dir = base_dir / "laporan" / "menu"
         if laporan_menu_dir.is_dir():
-            files_to_upload = [str(f) for f in sorted(laporan_menu_dir.glob("*.xlsx"))]
+            # File master di root laporan/menu
+            for f in sorted(laporan_menu_dir.glob("*.xlsx")):
+                files_to_upload.append((str(f), None))
+            # File per-outlet di subfolder laporan/menu/<outlet>/
+            for subfolder in sorted(laporan_menu_dir.iterdir()):
+                if subfolder.is_dir():
+                    for f in sorted(subfolder.glob("*.xlsx")):
+                        files_to_upload.append((str(f), subfolder.name))
 
     if not files_to_upload:
-        print(f"{YELLOW}[WARN] Tidak ada file master yang ditemukan di '{base_dir / 'laporan' / 'menu'}'.{RESET}")
+        print(f"{YELLOW}[WARN] Tidak ada file yang ditemukan di '{base_dir / 'laporan' / 'menu'}'.{RESET}")
         print("Pastikan Anda sudah menjalankan scraper menu Grab terlebih dahulu.")
         sys.exit(0)
 
@@ -156,8 +171,8 @@ def main():
     print("-" * 64)
 
     success_count = 0
-    for f_path in files_to_upload:
-        success = upload_file_to_gdrive(f_path, script_url, folder_id)
+    for f_path, sub_folder in files_to_upload:
+        success = upload_file_to_gdrive(f_path, script_url, folder_id, sub_folder_name=sub_folder)
         if success:
             success_count += 1
         print("-" * 64)

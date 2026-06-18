@@ -95,6 +95,7 @@ def check_and_upload_gdrive(master_item_xlsx, master_mod_xlsx, portals):
     """
     Fungsi penunjang untuk otomatis mengunggah file hasil laporan (.xlsx) yang relevan
     (file master dan file per-outlet yang diproses pada sesi ini) ke Google Drive.
+    File master diunggah ke folder root, file per-outlet ke subfolder bernama safe_name outlet.
     """
     gdrive_url = os.environ.get("GDRIVE_APPSCRIPT_URL")
     if gdrive_url:
@@ -108,28 +109,21 @@ def check_and_upload_gdrive(master_item_xlsx, master_mod_xlsx, portals):
             
             laporan_dir = Path(master_item_xlsx).parent
             
-            # Kumpulkan nama file aman (safe names) untuk outlet yang diproses di sesi ini
+            # Kumpulkan safe names untuk outlet yang diproses di sesi ini
             active_safe_names = set()
             for p in portals:
                 safe_name = (f"{p['outlet']}_{p['branch']}" if p['branch'] else p['outlet']).replace("/", "_").replace("\\", "_")
                 active_safe_names.add(safe_name)
                 
-            # Filter file .xlsx yang ada di direktori laporan
-            xlsx_files = sorted(laporan_dir.glob("*.xlsx"))
+            # Hanya unggah file per-outlet (subfolder) — file master tidak diunggah ke Drive
+            # Format: (file_path, sub_folder_name)
             files_to_upload = []
             
-            for f in xlsx_files:
-                # Selalu unggah file master
-                if f.name in ("0Master_menu_item.xlsx", "0Master_menu_modifier.xlsx"):
-                    files_to_upload.append(f)
-                    continue
-                
-                # Hanya unggah file per-outlet jika safe_name-nya ada di daftar aktif sesi ini
-                stem = f.stem
-                for active_name in active_safe_names:
-                    if stem == f"{active_name}_menu_item" or stem == f"{active_name}_menu_modifier":
-                        files_to_upload.append(f)
-                        break
+            for active_name in sorted(active_safe_names):
+                outlet_subdir = laporan_dir / active_name
+                if outlet_subdir.is_dir():
+                    for f in sorted(outlet_subdir.glob("*.xlsx")):
+                        files_to_upload.append((f, active_name))
             
             if not files_to_upload:
                 log.warning("⚠️ Tidak ada file .xlsx relevan yang ditemukan di folder laporan untuk diunggah.")
@@ -137,8 +131,12 @@ def check_and_upload_gdrive(master_item_xlsx, master_mod_xlsx, portals):
                 
             log.info(f"Ditemukan {len(files_to_upload)} file .xlsx relevan (master + outlet aktif) untuk diunggah.")
             success_count = 0
-            for f_path in files_to_upload:
-                if upload_file_to_gdrive(str(f_path), gdrive_url, folder_id):
+            for f_path, sub_folder in files_to_upload:
+                if sub_folder:
+                    log.info(f"  📂 Mengunggah ke subfolder '{sub_folder}': {f_path.name}")
+                else:
+                    log.info(f"  📄 Mengunggah ke folder root: {f_path.name}")
+                if upload_file_to_gdrive(str(f_path), gdrive_url, folder_id, sub_folder_name=sub_folder):
                     success_count += 1
                 
             if success_count == len(files_to_upload):
@@ -302,9 +300,11 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                     if col not in df_mods.columns: df_mods[col] = ""
                 df_mods = df_mods[mod_cols]
 
-            # Overwrite approach for two separate files (Cookie Mode)
-            item_xlsx = laporan_dir / f"{safe_name}_menu_item.xlsx"
-            mod_xlsx  = laporan_dir / f"{safe_name}_menu_modifier.xlsx"
+            # Simpan ke subfolder per-outlet (Cookie Mode)
+            outlet_subdir = laporan_dir / safe_name
+            outlet_subdir.mkdir(parents=True, exist_ok=True)
+            item_xlsx = outlet_subdir / f"{safe_name}_menu_item.xlsx"
+            mod_xlsx  = outlet_subdir / f"{safe_name}_menu_modifier.xlsx"
             
             # Hapus file lama jika ada
             for f in (item_xlsx, mod_xlsx):
@@ -316,15 +316,15 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
             with pd.ExcelWriter(mod_xlsx, engine="openpyxl") as writer:
                 df_mods.to_excel(writer, sheet_name="Modifier", index=False)
 
-            log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — {len(matched_items)} items, {len(matched_mods)} modifiers → {item_xlsx.name} & {mod_xlsx.name}")
+            log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — {len(matched_items)} items, {len(matched_mods)} modifiers → {safe_name}/{item_xlsx.name} & {safe_name}/{mod_xlsx.name}")
 
         # --- Master merge (cookie mode) ---
         log.info("="*60)
         log.info("  [COOKIE MODE] SEMUA PORTAL SELESAI")
         log.info("="*60)
 
-        # Merge Items
-        item_files = sorted(laporan_dir.glob("*_menu_item.xlsx")) if laporan_dir.exists() else []
+        # Merge Items — scan subfolder outlet
+        item_files = sorted(laporan_dir.glob("*/*_menu_item.xlsx")) if laporan_dir.exists() else []
         item_files = [f for f in item_files if f.name != "0Master_menu_item.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
         if outlet_filter or branch_filter:
             valid_stems = set()
@@ -339,7 +339,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                 try:
                     df = pd.read_excel(xp, sheet_name="Item", dtype=str)
                     if not df.empty: all_items.append(df)
-                    log.info(f"  🔍 [MERGE ITEM] Loaded '{xp.name}' | Items: {len(df)}")
+                    log.info(f"  🔍 [MERGE ITEM] Loaded '{xp.parent.name}/{xp.name}' | Items: {len(df)}")
                 except Exception as e:
                     log.error(f"  ❌ Gagal baca '{xp.name}': {e}")
         
@@ -350,8 +350,8 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
         with pd.ExcelWriter(master_item_xlsx, engine="openpyxl") as writer:
             master_items.to_excel(writer, sheet_name="Item", index=False)
 
-        # Merge Modifiers
-        mod_files = sorted(laporan_dir.glob("*_menu_modifier.xlsx")) if laporan_dir.exists() else []
+        # Merge Modifiers — scan subfolder outlet
+        mod_files = sorted(laporan_dir.glob("*/*_menu_modifier.xlsx")) if laporan_dir.exists() else []
         mod_files = [f for f in mod_files if f.name != "0Master_menu_modifier.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
         if outlet_filter or branch_filter:
             valid_stems = set()
@@ -366,7 +366,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                 try:
                     df = pd.read_excel(xp, sheet_name="Modifier", dtype=str)
                     if not df.empty: all_mods.append(df)
-                    log.info(f"  🔍 [MERGE MODIFIER] Loaded '{xp.name}' | Modifiers: {len(df)}")
+                    log.info(f"  🔍 [MERGE MODIFIER] Loaded '{xp.parent.name}/{xp.name}' | Modifiers: {len(df)}")
                 except Exception as e:
                     log.error(f"  ❌ Gagal baca '{xp.name}': {e}")
                     
@@ -460,10 +460,13 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                     for portal in related_portals:
                         portal_id = portal["id"]
                         outlet_name = f"{portal['outlet']} ({portal['branch']})" if portal['branch'] else portal['outlet']
-                        laporan_dir.mkdir(parents=True, exist_ok=True)
                         
                         portal_safe_name = f"{portal['outlet']}_{portal['branch']}" if portal['branch'] else f"{portal['outlet']}"
                         portal_safe_name = portal_safe_name.replace("/", "_").replace("\\", "_")
+                        
+                        # Buat subfolder per outlet
+                        outlet_subdir = laporan_dir / portal_safe_name
+                        outlet_subdir.mkdir(parents=True, exist_ok=True)
                         
                         matched_items = []
                         matched_modifiers = []
@@ -500,8 +503,8 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                                     mod_copy["Store ID"] = portal["store_id"]
                                 matched_modifiers.append(mod_copy)
 
-                        item_xlsx = laporan_dir / f"{portal_safe_name}_menu_item.xlsx"
-                        mod_xlsx  = laporan_dir / f"{portal_safe_name}_menu_modifier.xlsx"
+                        item_xlsx = outlet_subdir / f"{portal_safe_name}_menu_item.xlsx"
+                        mod_xlsx  = outlet_subdir / f"{portal_safe_name}_menu_modifier.xlsx"
                         
                         # Hapus file lama jika ada
                         for f in (item_xlsx, mod_xlsx):
@@ -545,7 +548,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
                         with pd.ExcelWriter(mod_xlsx, engine="openpyxl") as writer:
                             df_mods.to_excel(writer, sheet_name="Modifier", index=False)
                             
-                        log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — Saved to: {item_xlsx.name} & {mod_xlsx.name}")
+                        log.info(f"  ✓ [PORTAL {portal_id}] {outlet_name} — Saved to: {portal_safe_name}/{item_xlsx.name} & {portal_safe_name}/{mod_xlsx.name}")
 
                 except Exception as e:
                     log.error(f"  ✗ [ACCOUNT] {username} CRITICAL ERROR: {str(e)}")
@@ -604,8 +607,8 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
     else:
         laporan_dir = Path("laporan") / "menu"
 
-    # Merge Items
-    item_files = sorted(laporan_dir.glob("*_menu_item.xlsx")) if laporan_dir.exists() else []
+    # Merge Items — scan subfolder outlet
+    item_files = sorted(laporan_dir.glob("*/*_menu_item.xlsx")) if laporan_dir.exists() else []
     item_files = [f for f in item_files if f.name != "0Master_menu_item.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
     if outlet_filter or branch_filter:
         valid_stems = set()
@@ -622,12 +625,12 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
             df_item = pd.read_excel(xlsx_path, sheet_name="Item", dtype=str)
             if not df_item.empty:
                 all_items_frames.append(df_item)
-            print(f"  🔍 [MERGE ITEM] Loaded '{xlsx_path.name}' | Items: {len(df_item)}")
+            print(f"  🔍 [MERGE ITEM] Loaded '{xlsx_path.parent.name}/{xlsx_path.name}' | Items: {len(df_item)}")
         except Exception as e:
             print(f"  ❌ [MERGE ITEM] Gagal membaca '{xlsx_path.name}': {e}")
 
-    # Merge Modifiers
-    mod_files = sorted(laporan_dir.glob("*_menu_modifier.xlsx")) if laporan_dir.exists() else []
+    # Merge Modifiers — scan subfolder outlet
+    mod_files = sorted(laporan_dir.glob("*/*_menu_modifier.xlsx")) if laporan_dir.exists() else []
     mod_files = [f for f in mod_files if f.name != "0Master_menu_modifier.xlsx" and not f.name.startswith("MASTER_") and not f.name.startswith("CUSTOM_")]
     if outlet_filter or branch_filter:
         valid_stems = set()
@@ -644,7 +647,7 @@ async def run_all(date_start: str = None, date_end: str = None, output_dir: str 
             df_mod = pd.read_excel(xlsx_path, sheet_name="Modifier", dtype=str)
             if not df_mod.empty:
                 all_mods_frames.append(df_mod)
-            print(f"  🔍 [MERGE MODIFIER] Loaded '{xlsx_path.name}' | Modifiers: {len(df_mod)}")
+            print(f"  🔍 [MERGE MODIFIER] Loaded '{xlsx_path.parent.name}/{xlsx_path.name}' | Modifiers: {len(df_mod)}")
         except Exception as e:
             print(f"  ❌ [MERGE MODIFIER] Gagal membaca '{xlsx_path.name}': {e}")
 

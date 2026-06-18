@@ -46,6 +46,7 @@ function doPost(e) {
     
     var data = JSON.parse(e.postData.contents);
     var folderId = data.folderId || defaultFolderId;
+    var subFolderName = data.subFolderName || "";  // Nama subfolder outlet (opsional)
     var fileName = data.fileName;
     var fileBase64 = data.fileBase64;
     var mimeType = data.mimeType || "application/octet-stream";
@@ -58,19 +59,32 @@ function doPost(e) {
     var decodedBytes = Utilities.base64Decode(fileBase64);
     var blob = Utilities.newBlob(decodedBytes, mimeType, fileName);
     
-    // Akses folder target di Google Drive
-    var folder;
+    // Akses folder induk di Google Drive
+    var parentFolder;
     if (folderId && folderId !== "YOUR_DEFAULT_FOLDER_ID" && folderId.trim() !== "") {
       try {
-        folder = DriveApp.getFolderById(folderId);
+        parentFolder = DriveApp.getFolderById(folderId);
       } catch (fErr) {
         return buildResponse("error", "Folder ID '" + folderId + "' tidak ditemukan atau tidak memiliki akses: " + fErr.toString());
       }
     } else {
-      folder = DriveApp.getRootFolder();
+      parentFolder = DriveApp.getRootFolder();
     }
     
-    // Cari file lama dengan nama yang sama di folder tersebut untuk dihapus (menghindari duplikasi)
+    // Jika ada subFolderName, cari atau buat subfolder di dalam folder induk
+    var folder = parentFolder;
+    var subFolderCreated = false;
+    if (subFolderName && subFolderName.trim() !== "") {
+      var existingSubFolders = parentFolder.getFoldersByName(subFolderName);
+      if (existingSubFolders.hasNext()) {
+        folder = existingSubFolders.next();  // Gunakan subfolder yang sudah ada
+      } else {
+        folder = parentFolder.createFolder(subFolderName);  // Buat subfolder baru
+        subFolderCreated = true;
+      }
+    }
+    
+    // Cari file lama dengan nama yang sama di folder target untuk dihapus (menghindari duplikasi)
     var existingFiles = folder.getFilesByName(fileName);
     var deleteCount = 0;
     while (existingFiles.hasNext()) {
@@ -87,6 +101,8 @@ function doPost(e) {
       url: newFile.getUrl(),
       fileName: fileName,
       folderId: folder.getId(),
+      subFolder: subFolderName || null,
+      subFolderCreated: subFolderCreated,
       deletedOldVersions: deleteCount
     });
     
